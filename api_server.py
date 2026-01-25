@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from resume_parser_mcp import (
     parse_resume_full, ParseResumeInput, ResponseFormat,
-    parse_name, parse_date_range, extract_all_skills, normalize_text
+    parse_name, parse_date_range, extract_technical_skills, normalize_text
 )
 
 # PDF/Word support
@@ -250,7 +250,7 @@ async def parse_dates(request: ParseDatesRequest):
 @app.post("/extract/skills", tags=["Utilities"], summary="Extract Skills from Text")
 async def extract_skills(text: str = Field(..., min_length=10)):
     """Extract technical skills from text."""
-    skills = extract_all_skills(text)
+    skills = extract_technical_skills(text)
     return {"skills": skills, "count": len(skills)}
 
 
