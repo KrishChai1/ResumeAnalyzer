@@ -247,10 +247,14 @@ async def parse_dates(request: ParseDatesRequest):
     }
 
 
+class ExtractSkillsRequest(BaseModel):
+    text: str = Field(..., min_length=10, description="Text to extract skills from")
+
+
 @app.post("/extract/skills", tags=["Utilities"], summary="Extract Skills from Text")
-async def extract_skills(text: str = Field(..., min_length=10)):
+async def extract_skills(request: ExtractSkillsRequest):
     """Extract technical skills from text."""
-    skills = extract_technical_skills(text)
+    skills = extract_technical_skills(request.text)
     return {"skills": skills, "count": len(skills)}
 
 
