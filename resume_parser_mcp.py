@@ -152,6 +152,7 @@ class ParseResumeInput(BaseModel):
     resume_text: str = Field(..., min_length=50, max_length=100000)
     response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
     filename: Optional[str] = Field(default=None)
+    file_path: Optional[str] = Field(default=None)  # Path to DOCX file for table extraction
     use_ai_validation: bool = Field(default=True)
 
 
@@ -187,8 +188,9 @@ def normalize_text(text: str) -> str:
 
 
 def extract_text_from_docx_with_tables(file_path: str) -> str:
-    """Extract text from DOCX including tables - handles all formats."""
+    """Extract text from DOCX including tables and text boxes - handles all formats."""
     from docx import Document
+    import re as regex
     doc = Document(file_path)
     
     all_text = []
@@ -211,7 +213,329 @@ def extract_text_from_docx_with_tables(file_path: str) -> str:
                 # Join cells with | separator
                 all_text.append(' | '.join(row_text))
     
+    # Extract text from text boxes (important for sidebar layouts like Nageswara)
+    try:
+        xml_str = doc.element.xml
+        # Find all text box content
+        pattern = r'<w:txbxContent[^>]*>(.*?)</w:txbxContent>'
+        matches = regex.findall(pattern, xml_str, regex.DOTALL)
+        
+        for match in matches:
+            # Extract actual text from the XML
+            text_pattern = r'<w:t[^>]*>([^<]+)</w:t>'
+            texts = regex.findall(text_pattern, match)
+            if texts:
+                combined = ' '.join(texts)
+                # Clean up excessive whitespace
+                combined = ' '.join(combined.split())
+                if combined and len(combined) > 5:
+                    all_text.append(combined)
+    except Exception:
+        pass  # Fall back to standard extraction
+    
     return '\n'.join(all_text)
+
+
+def extract_from_docx_textboxes(file_path: str) -> Dict:
+    """
+    Extract structured data from DOCX text boxes (sidebar layouts).
+    Returns dict with: contact, education, certifications, skills
+    """
+    import re as regex
+    from docx import Document
+    
+    result = {
+        'phone': None,
+        'email': None,
+        'linkedin': None,
+        'education': [],
+        'certifications': [],
+        'skills': []
+    }
+    
+    seen_education = set()  # For deduplication
+    
+    try:
+        doc = Document(file_path)
+        xml_str = doc.element.xml
+        
+        # Find all text box content
+        pattern = r'<w:txbxContent[^>]*>(.*?)</w:txbxContent>'
+        matches = regex.findall(pattern, xml_str, regex.DOTALL)
+        
+        seen_texts = set()
+        
+        for match in matches:
+            # Extract actual text from the XML
+            text_pattern = r'<w:t[^>]*>([^<]+)</w:t>'
+            texts = regex.findall(text_pattern, match)
+            if texts:
+                combined = ' '.join(texts)
+                combined = ' '.join(combined.split())
+                
+                # Skip duplicates
+                if combined in seen_texts:
+                    continue
+                seen_texts.add(combined)
+                
+                # Extract phone
+                phone_match = regex.search(r'Mobile[:\s]*([+\d\s\-\(\)]{10,20})', combined, regex.IGNORECASE)
+                if phone_match and not result['phone']:
+                    result['phone'] = phone_match.group(1).strip()
+                
+                # Extract email
+                email_match = regex.search(r'Mail[:\s]*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', combined, regex.IGNORECASE)
+                if email_match and not result['email']:
+                    result['email'] = email_match.group(1).strip()
+                
+                # Also check for plain email format
+                if not result['email']:
+                    email_match = regex.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', combined)
+                    if email_match:
+                        result['email'] = email_match.group(1).strip()
+                
+                # Extract LinkedIn
+                linkedin_match = regex.search(r'LinkedIn[:\s]*([a-zA-Z0-9\-]+)', combined, regex.IGNORECASE)
+                if linkedin_match and not result['linkedin']:
+                    result['linkedin'] = linkedin_match.group(1).strip()
+                
+                # Extract education (Qualification/Masters/Bachelor) - with deduplication
+                edu_match = regex.search(r'(?:Qualification|Education)[:\s]*(.+?)(?:$|CONTACT|SKILLS)', combined, regex.IGNORECASE)
+                if edu_match:
+                    edu_text = edu_match.group(1).strip()
+                    edu_key = edu_text.lower()[:50]  # Use first 50 chars as key
+                    if edu_text and len(edu_text) > 10 and edu_key not in seen_education:
+                        seen_education.add(edu_key)
+                        result['education'].append(edu_text)
+                
+                # Also check for degree patterns - with deduplication
+                degree_match = regex.search(r'(Masters?|Bachelor|B\.?Tech|M\.?Tech|MBA|MCA|BCA|B\.?E|M\.?E|Ph\.?D)[^,]*(?:in|of)[^,]+(?:from|at)[^,]+(?:University|College|Institute)[^,]*', combined, regex.IGNORECASE)
+                if degree_match:
+                    edu_text = degree_match.group(0).strip()
+                    edu_key = edu_text.lower()[:50]
+                    if edu_text and edu_key not in seen_education:
+                        seen_education.add(edu_key)
+                        result['education'].append(edu_text)
+                
+                # Extract certifications (GCP, AWS, Azure, etc.)
+                if 'Certifications' in combined or 'GCP' in combined or 'AWS' in combined:
+                    cert_matches = regex.findall(r'(GCP[^,\n]+|AWS[^,\n]+|Azure[^,\n]+|DP-?\d+[^,\n]*)', combined, regex.IGNORECASE)
+                    for cert in cert_matches:
+                        cert = cert.strip()
+                        if cert and cert not in result['certifications']:
+                            result['certifications'].append(cert)
+    except Exception:
+        pass
+    
+    return result
+
+
+def extract_text_from_textboxes(file_path: str) -> str:
+    """
+    Extract text from DOCX text boxes (shapes).
+    Used for multi-column layouts like Nageswara's resume where
+    contact info is in a sidebar text box.
+    """
+    from docx import Document
+    doc = Document(file_path)
+    
+    all_textbox_content = []
+    
+    # Find all w:txbxContent elements (text box content)
+    for txbx in doc.element.iter():
+        if txbx.tag.endswith('txbxContent'):
+            texts = []
+            for t in txbx.iter():
+                if t.tag.endswith('}t') and t.text:
+                    texts.append(t.text)
+            if texts:
+                content = ' '.join(texts)
+                all_textbox_content.append(content)
+    
+    return '\n'.join(all_textbox_content)
+
+
+def extract_all_text_from_docx(file_path: str) -> str:
+    """
+    Extract ALL text from DOCX: paragraphs + tables + text boxes.
+    Handles multi-column layouts, sidebars, and complex formatting.
+    """
+    from docx import Document
+    doc = Document(file_path)
+    
+    all_text = []
+    
+    # 1. Extract paragraphs
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            all_text.append(text)
+    
+    # 2. Extract tables
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = []
+            for cell in row.cells:
+                cell_text = cell.text.strip()
+                if cell_text:
+                    row_text.append(cell_text)
+            if row_text:
+                all_text.append(' | '.join(row_text))
+    
+    # 3. Extract text boxes (for multi-column layouts)
+    for txbx in doc.element.iter():
+        if txbx.tag.endswith('txbxContent'):
+            texts = []
+            for t in txbx.iter():
+                if t.tag.endswith('}t') and t.text:
+                    texts.append(t.text)
+            if texts:
+                content = ' '.join(texts)
+                # Avoid duplicates
+                if content not in all_text:
+                    all_text.append(content)
+    
+    return '\n'.join(all_text)
+
+
+def extract_from_docx_tables(file_path: str) -> Dict:
+    """
+    Extract structured data from table-based DOCX resumes.
+    Returns dict with: summary, skills, education, experience, responsibilities_tables
+    """
+    from docx import Document
+    doc = Document(file_path)
+    
+    result = {
+        'summary': '',
+        'skills': {},
+        'education': [],
+        'experience': [],
+        'tools': [],
+        'responsibilities_tables': []  # For Nageswara-style resumes
+    }
+    
+    for table_idx, table in enumerate(doc.tables):
+        rows = table.rows
+        if not rows:
+            continue
+        
+        # Check first cell to determine table type
+        first_cell = rows[0].cells[0].text.strip().lower() if rows[0].cells else ""
+        first_cell_full = rows[0].cells[0].text.strip() if rows[0].cells else ""
+        
+        # Skills table: "EtlTools | Informatica..." or "TECHNICAL"
+        if any(kw in first_cell for kw in ['tools', 'database', 'language', 'reporting', 'scheduling', 'technical', 'operating']):
+            for row in rows:
+                if len(row.cells) >= 2:
+                    key = row.cells[0].text.strip()
+                    value = row.cells[1].text.strip()
+                    if key and value:
+                        result['skills'][key] = value
+        
+        # Education table
+        elif 'education' in first_cell:
+            for row in rows:
+                if len(row.cells) >= 2:
+                    edu_text = row.cells[1].text.strip()
+                    if edu_text and 'education' not in edu_text.lower():
+                        result['education'].append(edu_text)
+        
+        # Experience table: "Client: X" pattern (Ramaswamy style)
+        elif first_cell.startswith('client'):
+            exp_entry = {
+                'employer': '',
+                'title': '',
+                'duration': '',
+                'description': '',
+                'responsibilities': [],
+                'tools': []
+            }
+            
+            for row in rows:
+                if not row.cells:
+                    continue
+                    
+                cell0 = row.cells[0].text.strip().lower()
+                # Get value from cell 1 or 2 (some tables have merged cells)
+                cell_value = ''
+                for cell in row.cells[1:]:
+                    if cell.text.strip():
+                        cell_value = cell.text.strip()
+                        break
+                
+                if 'client' in cell0:
+                    # "Client: UOB Bank" in first cell
+                    client_text = row.cells[0].text.strip()
+                    match = re.search(r'Client:\s*(.+)', client_text, re.IGNORECASE)
+                    if match:
+                        exp_entry['employer'] = match.group(1).strip()
+                    
+                    # Duration might be in another cell
+                    for cell in row.cells[1:]:
+                        dur_match = re.search(r'Duration:\s*(.+)', cell.text, re.IGNORECASE)
+                        if dur_match:
+                            exp_entry['duration'] = dur_match.group(1).strip()
+                
+                elif 'duration' in cell0:
+                    dur_match = re.search(r'Duration:\s*(.+)', row.cells[0].text, re.IGNORECASE)
+                    if dur_match:
+                        exp_entry['duration'] = dur_match.group(1).strip()
+                    elif cell_value:
+                        exp_entry['duration'] = cell_value
+                
+                elif 'description' in cell0 or 'brief' in cell0:
+                    exp_entry['description'] = cell_value
+                
+                elif 'responsibilities' in cell0 or 'role' in cell0:
+                    # Split responsibilities by newline or bullet
+                    resp_text = cell_value
+                    resps = re.split(r'\n|•|►|■', resp_text)
+                    exp_entry['responsibilities'] = [r.strip() for r in resps if r.strip() and len(r.strip()) > 20]
+                
+                elif 'tools' in cell0 or 'technologies' in cell0 or 'environment' in cell0:
+                    exp_entry['tools'] = [t.strip() for t in re.split(r'[,|]', cell_value) if t.strip()]
+            
+            if exp_entry['employer']:
+                result['experience'].append(exp_entry)
+        
+        # Responsibilities table (Nageswara style) - tables with responsibilities/environment
+        elif 'environment' in first_cell or any(kw in first_cell_full for kw in ['responsible', 'worked on', 'team lead', 'developer', 'engineer']):
+            resp_entry = {
+                'responsibilities': [],
+                'tools': [],
+                'environment': ''
+            }
+            
+            for row in rows:
+                for cell in row.cells:
+                    cell_text = cell.text.strip()
+                    if not cell_text:
+                        continue
+                    
+                    # Check if it's an environment line
+                    if cell_text.lower().startswith('environment'):
+                        resp_entry['environment'] = cell_text
+                        # Extract tools from environment
+                        tools_match = re.search(r'Environment\s*:\s*(.+)', cell_text, re.IGNORECASE)
+                        if tools_match:
+                            resp_entry['tools'] = [t.strip() for t in re.split(r'[,|]', tools_match.group(1)) if t.strip()]
+                    else:
+                        # It's responsibilities
+                        resps = re.split(r'\n|•|►|■', cell_text)
+                        for resp in resps:
+                            resp = resp.strip()
+                            if resp and len(resp) > 20 and not resp.lower().startswith('environment'):
+                                resp_entry['responsibilities'].append(resp)
+            
+            if resp_entry['responsibilities'] or resp_entry['tools']:
+                result['responsibilities_tables'].append(resp_entry)
+        
+        # Summary table (single cell with "years of experience")
+        elif 'experience' in first_cell or 'year' in first_cell:
+            result['summary'] = rows[0].cells[0].text.strip()
+    
+    return result
 
 
 def clean_output_text(text: str) -> str:
@@ -754,6 +1078,129 @@ def parse_short_date(text: str) -> Tuple[Optional[int], Optional[int], bool]:
     return parse_date(text)
 
 
+def parse_table_duration(duration_str: str) -> Tuple[str, str, int]:
+    """
+    Parse duration string like "Nov-2023 to Till date" or "Sep-2022 to Oct-2023"
+    Returns: (start_date, end_date, duration_months)
+    """
+    if not duration_str:
+        return "", "", 0
+    
+    # Pattern: "Mon-YYYY to Mon-YYYY" or "Mon-YYYY to Till date"
+    match = re.search(r'(\w{3})[-/]?(\d{4})\s+to\s+(\w+)[-/]?(\d{4})?', duration_str, re.IGNORECASE)
+    if match:
+        start_month_str = match.group(1).lower()
+        start_year = int(match.group(2))
+        end_str = match.group(3).lower()
+        end_year_str = match.group(4)
+        
+        start_month = MONTH_MAP.get(start_month_str[:3], 1)
+        
+        if 'till' in end_str or 'present' in end_str or 'current' in end_str or 'date' in end_str:
+            end_year = datetime.now().year
+            end_month = datetime.now().month
+        else:
+            end_month = MONTH_MAP.get(end_str[:3], 12)
+            end_year = int(end_year_str) if end_year_str else start_year
+        
+        duration = calculate_duration(start_year, start_month, end_year, end_month)
+        start_date = f"{start_year}-{start_month:02d}"
+        end_date = f"{end_year}-{end_month:02d}"
+        
+        return start_date, end_date, duration
+    
+    return "", "", 0
+
+
+def extract_experiences_from_tables(table_data: Dict) -> List[ExperienceEntry]:
+    """
+    Convert table-extracted experience data to ExperienceEntry objects.
+    """
+    experiences = []
+    
+    for exp in table_data.get('experience', []):
+        start_date, end_date, duration = parse_table_duration(exp.get('duration', ''))
+        
+        # Extract title from description or use generic
+        title = ""
+        desc = exp.get('description', '')
+        if desc:
+            # Try to find role in description
+            role_match = re.search(r'(?:role|position|working as)\s*[:\-]?\s*([A-Za-z\s]+)', desc, re.IGNORECASE)
+            if role_match:
+                title = role_match.group(1).strip()
+        
+        if not title:
+            # Try to infer from tools
+            tools = exp.get('tools', [])
+            if any('snowflake' in t.lower() for t in tools):
+                title = "Data Engineer"
+            elif any('informatica' in t.lower() for t in tools):
+                title = "ETL Developer"
+            elif any('teradata' in t.lower() for t in tools):
+                title = "Data Warehouse Developer"
+            else:
+                title = "Data Professional"
+        
+        experiences.append(ExperienceEntry(
+            employer=exp.get('employer', ''),
+            title=title,
+            location="",
+            start_date=start_date,
+            end_date=end_date,
+            duration_months=duration,
+            responsibilities=exp.get('responsibilities', [])[:12],
+            tools=exp.get('tools', []),
+            client=""
+        ))
+    
+    return experiences
+
+
+def extract_education_from_tables(table_data: Dict) -> List[Dict]:
+    """
+    Convert table-extracted education data to standard format.
+    """
+    education = []
+    
+    for edu_text in table_data.get('education', []):
+        # Parse "Master of Computer Application (M.C.A) at Osmania University, India"
+        degree = ""
+        institution = ""
+        year = None
+        
+        # Pattern: "Degree at/from Institution, Location"
+        match = re.match(r'(.+?)\s+(?:at|from)\s+(.+)', edu_text, re.IGNORECASE)
+        if match:
+            degree = match.group(1).strip()
+            institution = match.group(2).strip()
+        else:
+            degree = edu_text
+        
+        # Try to extract year
+        year_match = re.search(r'\b(19\d{2}|20\d{2})\b', edu_text)
+        if year_match:
+            year = year_match.group(1)
+        
+        education.append({
+            'degree': degree,
+            'institution': institution if institution else None,
+            'year': year
+        })
+    
+    return education
+    match = re.match(r'(\w{3})(\d{2})$', text, re.IGNORECASE)
+    if match:
+        month_str = match.group(1).lower()
+        year_short = int(match.group(2))
+        month = MONTH_MAP.get(month_str, 1)
+        year = 2000 + year_short if year_short < 50 else 1900 + year_short
+        return year, month, False
+    
+    # Fallback to regular parse
+    return parse_date(text)
+
+
 def calculate_duration(start_year: int, start_month: int, end_year: int, end_month: int) -> int:
     """Calculate duration in months (inclusive of both start and end month)."""
     start_dt = datetime(start_year, start_month or 1, 1)
@@ -1258,108 +1705,163 @@ def extract_tools_from_text(text: str) -> List[str]:
 def extract_education(text: str) -> List[Dict[str, str]]:
     """Extract education - handles multiple formats."""
     education = []
+    seen_degrees = set()  # Track unique degrees to avoid duplicates
     
-    # Find education section
+    # Find education section (multiple possible headers)
+    # Note: Be specific to avoid matching "TECHNICAL QUALIFICATION"
     edu_match = re.search(
-        r'EDUCATION(?:AL)?\s*(?:QUALIFICATION)?[:\s]*\n(.+?)(?:\nROLES|\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nPERSONAL|\nCERTIFI|\nCORE|\nAS\s+A\s+SCRUM|\n_+|\Z)',
+        r'(?:EDUCATION(?:AL)?\s*(?:QUALIFICATION|BACKGROUND|DETAILS)?|ACADEMIC\s*(?:QUALIFICATION|BACKGROUND)?)[:\s]*\n?(.+?)(?:\nROLES|\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nPERSONAL|\nCERTIFI|\nCORE|\nAS\s+A\s+SCRUM|\nSKILLS|\nACHIEVEMENT|\n_+|\Z)',
         text, re.IGNORECASE | re.DOTALL
     )
     
-    if not edu_match:
+    # Also try inline patterns like "Masters in X from Y University"
+    # Only match clear education patterns with institution names
+    inline_patterns = [
+        # "Masters in Computer Science from Sri Venkateswara University, Tirupati"
+        r'(Masters?|Bachelor\'?s?|MBA|MCA|BCA|B\.?Tech|M\.?Tech|Ph\.?D|Doctorate)\s+(?:in|of)\s+([A-Za-z\s]{3,30}?)\s+from\s+([A-Za-z\s]{3,40}?(?:University|College|Institute)[A-Za-z\s,]{0,30})',
+    ]
+    
+    for pattern in inline_patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            degree_type = match.group(1).strip()
+            field = match.group(2).strip()
+            institution = match.group(3).strip()
+            
+            # Build unique key
+            degree_str = f"{degree_type} in {field}".strip()
+            degree_key = degree_str.lower()
+            
+            # Skip if already seen
+            if degree_key in seen_degrees:
+                continue
+            seen_degrees.add(degree_key)
+            
+            education.append({
+                'degree': degree_str,
+                'institution': institution,
+                'year': None
+            })
+    
+    if not edu_match and not education:
         return education
     
-    edu_section = edu_match.group(1)
-    lines = [l.strip() for l in edu_section.split('\n') if l.strip() and not l.strip().startswith('_')]
-    
-    i = 0
-    while i < len(lines):
-        line = lines[i]
+    if edu_match:
+        edu_section = edu_match.group(1)
+        lines = [l.strip() for l in edu_section.split('\n') if l.strip() and not l.strip().startswith('_')]
         
-        # Skip irrelevant lines
-        if re.match(r'^(Worked|Working|•|-|\*|PROFESSIONAL|Roles|As\s+a\s+Scrum|Facilitate)', line, re.IGNORECASE):
-            i += 1
-            continue
-        
-        entry = {}
-        
-        # Format 1: "Degree | Institution | Month Year" (Sudheer/Pipe format)
-        # Example: "Master of Science, Information Systems | Texas A&M International University | Dec 2015"
-        if line.count('|') >= 2:
-            parts = [p.strip() for p in line.split('|')]
-            entry['degree'] = parts[0]
-            entry['institution'] = parts[1]
-            # Extract year from last part
-            year_match = re.search(r'(\d{4})', parts[-1])
-            if year_match:
-                entry['year'] = year_match.group(1)
-            education.append(entry)
-            i += 1
-            continue
-        
-        # Format 2: "Degree – Institution | Year-Year" (Jimmy format)
-        # Example: "Master of Computer Applications (MCA) – IGNOU, New Delhi, India | 2001–2004"
-        dash_pipe_match = re.match(r'^(.+?)\s*[-–]\s*(.+?)\s*\|\s*(\d{4})\s*[-–]\s*(\d{4})\s*$', line)
-        if dash_pipe_match:
-            entry['degree'] = dash_pipe_match.group(1).strip()
-            entry['institution'] = dash_pipe_match.group(2).strip()
-            entry['year'] = dash_pipe_match.group(4)  # End year
-            education.append(entry)
-            i += 1
-            continue
-        
-        # Format 3: "Institution DateRange" then "Degree" on next line (Khaliq format)
-        # Example: "University of Mysore Aug 2012 - Jun 2014" then "MBA, Marketing"
-        date_range_match = re.search(r'(\w+\s+\d{4})\s*[-–]\s*(\w+\s+\d{4})', line)
-        if date_range_match:
-            inst_part = line[:date_range_match.start()].strip()
-            year = date_range_match.group(2).split()[-1]  # Get end year
+        i = 0
+        while i < len(lines):
+            line = lines[i]
             
-            if inst_part:
-                entry['institution'] = inst_part
-                entry['year'] = year
+            # Skip irrelevant lines
+            if re.match(r'^(Worked|Working|•|-|\*|PROFESSIONAL|Roles|As\s+a\s+Scrum|Facilitate|Client:|Role|Analysis|Find|Set up|Duration)', line, re.IGNORECASE):
+                i += 1
+                continue
+            
+            entry = {}
+            
+            # Format 1: "Degree | Institution | Month Year" (Sudheer/Pipe format)
+            # Example: "Master of Science, Information Systems | Texas A&M International University | Dec 2015"
+            if line.count('|') >= 2:
+                parts = [p.strip() for p in line.split('|')]
+                entry['degree'] = parts[0]
+                entry['institution'] = parts[1]
+                # Extract year from last part
+                year_match = re.search(r'(\d{4})', parts[-1])
+                if year_match:
+                    entry['year'] = year_match.group(1)
                 
-                # Next line should be degree
-                if i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
-                    if not re.search(r'\d{4}\s*[-–]\s*\d{4}', next_line):
-                        degree_keywords = ['master', 'bachelor', 'mba', 'mca', 'bca', 'b.tech', 'm.tech', 'engineering', 'science', 'arts']
-                        if any(kw in next_line.lower() for kw in degree_keywords) or ',' in next_line:
-                            entry['degree'] = next_line
-                            i += 1
+                # Check for duplicate
+                degree_key = entry['degree'].lower()
+                if degree_key not in seen_degrees:
+                    seen_degrees.add(degree_key)
+                    education.append(entry)
+                i += 1
+                continue
+            
+            # Format 2: "Degree – Institution | Year-Year" (Jimmy format)
+            # Example: "Master of Computer Applications (MCA) – IGNOU, New Delhi, India | 2001–2004"
+            dash_pipe_match = re.match(r'^(.+?)\s*[-–]\s*(.+?)\s*\|\s*(\d{4})\s*[-–]\s*(\d{4})\s*$', line)
+            if dash_pipe_match:
+                entry['degree'] = dash_pipe_match.group(1).strip()
+                entry['institution'] = dash_pipe_match.group(2).strip()
+                entry['year'] = dash_pipe_match.group(4)  # End year
                 
+                degree_key = entry['degree'].lower()
+                if degree_key not in seen_degrees:
+                    seen_degrees.add(degree_key)
+                    education.append(entry)
+                i += 1
+                continue
+            
+            # Format 3: "Institution DateRange" then "Degree" on next line (Khaliq format)
+            # Example: "University of Mysore Aug 2012 - Jun 2014" then "MBA, Marketing"
+            date_range_match = re.search(r'(\w+\s+\d{4})\s*[-–]\s*(\w+\s+\d{4})', line)
+            if date_range_match:
+                inst_part = line[:date_range_match.start()].strip()
+                year = date_range_match.group(2).split()[-1]  # Get end year
+                
+                if inst_part:
+                    entry['institution'] = inst_part
+                    entry['year'] = year
+                    
+                    # Next line should be degree
+                    if i + 1 < len(lines):
+                        next_line = lines[i + 1].strip()
+                        if not re.search(r'\d{4}\s*[-–]\s*\d{4}', next_line):
+                            degree_keywords = ['master', 'bachelor', 'mba', 'mca', 'bca', 'b.tech', 'm.tech', 'engineering', 'science', 'arts']
+                            if any(kw in next_line.lower() for kw in degree_keywords) or ',' in next_line:
+                                entry['degree'] = next_line
+                                i += 1
+                    
+                    education.append(entry)
+                    i += 1
+                    continue
+            
+            # Format 4: "Degree From Institution Year" (Madhuri format)
+            from_match = re.match(r'^(.+?)\s+[Ff]rom\s+(.+?)\s+(?:\w+\s+)?(\d{4})$', line)
+            if from_match:
+                entry['degree'] = from_match.group(1).strip()
+                entry['institution'] = from_match.group(2).strip()
+                entry['year'] = from_match.group(3)
                 education.append(entry)
                 i += 1
                 continue
-        
-        # Format 4: "Degree From Institution Year" (Madhuri format)
-        from_match = re.match(r'^(.+?)\s+[Ff]rom\s+(.+?)\s+(?:\w+\s+)?(\d{4})$', line)
-        if from_match:
-            entry['degree'] = from_match.group(1).strip()
-            entry['institution'] = from_match.group(2).strip()
-            entry['year'] = from_match.group(3)
-            education.append(entry)
+            
+            # Format 5: Simple degree line with institution
+            # Use regex for word boundaries to avoid false positives like "must be present"
+            degree_patterns = [
+                r'\bmaster', r'\bbachelor', r'\bmba\b', r'\bmca\b', r'\bbca\b', 
+                r'\bb\.?tech\b', r'\bm\.?tech\b', r'\bb\.?e\.?\b', r'\bm\.?e\.?\b', 
+                r'\bph\.?d\b', r'^me\s', r'^be\s', r'\bengineering\b'
+            ]
+            if any(re.search(p, line.lower()) for p in degree_patterns):
+                # Additional check: skip if line looks like responsibilities
+                skip_patterns = [r'analyze', r'provide', r'support', r'data must', r'tools\s*[&:]', r'environment']
+                if any(re.search(p, line.lower()) for p in skip_patterns):
+                    i += 1
+                    continue
+                
+                parts = re.split(r'\s*[-–]\s*', line, maxsplit=1)
+                entry['degree'] = parts[0].strip()
+                
+                if len(parts) > 1:
+                    rest = parts[1]
+                    year_match = re.search(r'(\d{4})\s*$', rest)
+                    if year_match:
+                        entry['year'] = year_match.group(1)
+                        entry['institution'] = rest[:year_match.start()].strip().rstrip(',|')
+                    else:
+                        entry['institution'] = rest.strip()
+                
+                if entry.get('degree'):
+                    # Final sanity check: degree should contain a degree keyword
+                    degree_lower = entry['degree'].lower()
+                    valid_degree = any(re.search(p, degree_lower) for p in [r'\bmaster', r'\bbachelor', r'\bmba\b', r'\bmca\b', r'\bbca\b', r'\btech\b', r'\bengineering\b', r'\bscience\b', r'\barts\b', r'\bcommerce\b', r'\bph\.?d'])
+                    if valid_degree:
+                        education.append(entry)
+            
             i += 1
-            continue
-        
-        # Format 5: Simple degree line with institution
-        degree_keywords = ['master', 'bachelor', 'mba', 'mca', 'bca', 'b.tech', 'm.tech', 'b.e', 'm.e', 'ph.d', 'me ', 'be ']
-        if any(kw in line.lower() for kw in degree_keywords):
-            parts = re.split(r'\s*[-–]\s*', line, maxsplit=1)
-            entry['degree'] = parts[0].strip()
-            
-            if len(parts) > 1:
-                rest = parts[1]
-                year_match = re.search(r'(\d{4})\s*$', rest)
-                if year_match:
-                    entry['year'] = year_match.group(1)
-                    entry['institution'] = rest[:year_match.start()].strip().rstrip(',|')
-                else:
-                    entry['institution'] = rest.strip()
-            
-            if entry.get('degree'):
-                education.append(entry)
-        
-        i += 1
     
     # Ensure all entries have all fields (null if missing)
     cleaned = []
@@ -1953,7 +2455,34 @@ async def parse_resume_full(params: ParseResumeInput) -> str:
     """Parse resume and return structured JSON - enterprise grade with validation."""
     text = normalize_text(params.resume_text)
     
-    # Extract all components
+    # =========================================================================
+    # STEP 1: Enhanced DOCX extraction (tables + text boxes for multi-column)
+    # =========================================================================
+    table_data = None
+    table_experiences = []
+    table_education = []
+    textbox_text = ""
+    
+    if params.file_path and params.file_path.endswith('.docx'):
+        try:
+            # Extract from tables
+            table_data = extract_from_docx_tables(params.file_path)
+            if table_data.get('experience'):
+                table_experiences = extract_experiences_from_tables(table_data)
+            if table_data.get('education'):
+                table_education = extract_education_from_tables(table_data)
+            
+            # Extract from text boxes (for multi-column layouts like Nageswara)
+            textbox_text = extract_text_from_textboxes(params.file_path)
+            if textbox_text:
+                # Merge textbox content with main text for contact/education extraction
+                text = text + "\n" + textbox_text
+        except Exception as e:
+            pass  # Fall back to text extraction
+    
+    # =========================================================================
+    # STEP 2: Standard text-based extraction
+    # =========================================================================
     contact = extract_contact(text)
     firstname, middle, lastname = extract_name(text)
     experiences = extract_experiences(text)
@@ -1961,6 +2490,84 @@ async def parse_resume_full(params: ParseResumeInput) -> str:
     certifications = extract_certifications(text)
     summary = extract_summary(text)
     title = extract_title(text, experiences)
+    
+    # =========================================================================
+    # STEP 3: Merge table and text extractions (prefer table data if richer)
+    # =========================================================================
+    if table_experiences:
+        # Use table experiences if they have more data
+        table_resp_count = sum(len(e.responsibilities) for e in table_experiences)
+        text_resp_count = sum(len(e.responsibilities) for e in experiences)
+        
+        if table_resp_count > text_resp_count or len(table_experiences) > len(experiences):
+            experiences = table_experiences
+    
+    if table_education and (not education or len(table_education) > len(education)):
+        education = table_education
+    
+    # Use table summary if available and text summary is empty
+    if table_data and table_data.get('summary') and not summary:
+        summary = table_data['summary']
+    
+    # =========================================================================
+    # STEP 4: Merge responsibilities from tables (Nageswara style)
+    # =========================================================================
+    if table_data and table_data.get('responsibilities_tables'):
+        resp_tables = table_data['responsibilities_tables']
+        # Match responsibilities tables to experiences by order
+        for i, exp in enumerate(experiences):
+            if i < len(resp_tables) and (not exp.responsibilities or len(exp.responsibilities) == 0):
+                exp.responsibilities = resp_tables[i].get('responsibilities', [])[:12]
+                if not exp.tools and resp_tables[i].get('tools'):
+                    exp.tools = resp_tables[i].get('tools', [])
+    
+    # =========================================================================
+    # STEP 5: Merge textbox data (for multi-column/sidebar layouts like Nageswara)
+    # =========================================================================
+    if params.file_path and params.file_path.endswith('.docx'):
+        try:
+            textbox_data = extract_from_docx_textboxes(params.file_path)
+            
+            # Merge contact info from textboxes if missing
+            if textbox_data.get('phone') and not contact.get('phone'):
+                contact['phone'] = textbox_data['phone']
+            if textbox_data.get('email') and not contact.get('email'):
+                contact['email'] = textbox_data['email']
+            if textbox_data.get('linkedin') and not contact.get('linkedin'):
+                contact['linkedin'] = textbox_data['linkedin']
+            
+            # Merge education from textboxes if missing (with deduplication)
+            if textbox_data.get('education') and not education:
+                seen_edu_keys = set()
+                for edu_text in textbox_data['education']:
+                    # Skip duplicates
+                    edu_key = edu_text.lower()[:50]
+                    if edu_key in seen_edu_keys:
+                        continue
+                    seen_edu_keys.add(edu_key)
+                    
+                    # Parse the education text
+                    degree_match = re.match(r'(.+?)\s+(?:from|at)\s+(.+)', edu_text, re.IGNORECASE)
+                    if degree_match:
+                        education.append({
+                            'degree': degree_match.group(1).strip(),
+                            'institution': degree_match.group(2).strip(),
+                            'year': None
+                        })
+                    else:
+                        education.append({
+                            'degree': edu_text,
+                            'institution': None,
+                            'year': None
+                        })
+            
+            # Merge certifications from textboxes
+            if textbox_data.get('certifications'):
+                for cert in textbox_data['certifications']:
+                    if cert not in certifications:
+                        certifications.append(cert)
+        except Exception:
+            pass
     
     # Apply data quality checks on experiences
     experiences = ensure_data_quality(experiences)
