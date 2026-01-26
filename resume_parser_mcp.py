@@ -1,12 +1,18 @@
 """
-Resume Parser MCP Server - Google-Level Production Grade
-=========================================================
-Enterprise resume parsing with Claude AI validation for accuracy.
-Supports PDF, Word documents with intelligent multi-format extraction.
+Resume Parser MCP Server - Enterprise Grade v2.1
+=================================================
+Google/LinkedIn-level resume parsing with comprehensive extraction.
+
+Features:
+- Multi-format support (PDF, DOCX, TXT)
+- Intelligent section detection
+- Comprehensive experience extraction with responsibilities
+- Skill-to-experience mapping with duration calculation
+- Education extraction from multiple formats
+- Claude AI validation for complex cases
 
 Configuration:
-- Set ANTHROPIC_API_KEY environment variable for AI validation
-- AI validation auto-activates when critical fields are missing
+- Set ANTHROPIC_API_KEY environment variable for AI enhancement
 """
 
 import json
@@ -17,7 +23,7 @@ from dateutil.relativedelta import relativedelta
 from typing import Optional, List, Dict, Any, Tuple, Set
 from enum import Enum
 from dataclasses import dataclass, field
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict
 import unicodedata
 
 try:
@@ -30,10 +36,10 @@ except ImportError:
 
 
 # ============================================================================
-# CONFIGURATION - Set your API key here or via environment variable
+# CONFIGURATION
 # ============================================================================
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")  # <-- ADD YOUR KEY HERE
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 
 # ============================================================================
@@ -51,17 +57,18 @@ SKILL_CATEGORIES = {
     "Data Engineering": [
         "etl", "data migration", "data pipelines", "informatica", "ssis", "talend",
         "apache airflow", "airflow", "apache spark", "spark", "pyspark",
-        "apache kafka", "kafka", "snowflake", "databricks", "dbt", "glue", "redshift"
+        "apache kafka", "kafka", "snowflake", "databricks", "dbt", "glue", "redshift",
+        "data warehousing", "dwh", "olap", "oltp", "star schema"
     ],
     "Programming": [
         "python", "java", "javascript", "typescript", "c++", "c#", "go", "golang",
         "rust", "ruby", "php", "swift", "kotlin", "scala", "cobol", "bash", "shell",
-        "powershell", "sql", "html", "css", "node.js", "nodejs", "react", "reactjs",
-        "angular", "vue", "django", "flask", ".net", "asp.net", "vb.net"
+        "powershell", "sql", "plsql", "html", "css", "node.js", "nodejs", "react",
+        "angular", "vue", "django", "flask", ".net", "asp.net", "vb.net", "gherkin"
     ],
     "Databases": [
         "mongodb", "cassandra", "redis", "postgresql", "mysql", "oracle", "db2",
-        "sql server", "nosql", "dynamodb", "elasticsearch", "neo4j"
+        "sql server", "nosql", "dynamodb", "elasticsearch", "neo4j", "sql developer"
     ],
     "Cloud": [
         "aws", "azure", "gcp", "google cloud", "ibm cloud", "openstack",
@@ -73,6 +80,11 @@ SKILL_CATEGORIES = {
         "jenkins", "gitlab", "github actions", "ci/cd", "cicd", "concourse",
         "helm", "gitops", "devops", "devsecops", "infrastructure as code"
     ],
+    "Testing & QA": [
+        "selenium", "pytest", "unittest", "testng", "junit", "cucumber", "behave",
+        "bdd", "tdd", "manual testing", "automation testing", "regression testing",
+        "api testing", "postman", "functional testing", "uat", "quality assurance"
+    ],
     "Security": [
         "sonarqube", "qualys", "crowdstrike", "mend", "uptycs", "snyk",
         "siem", "splunk", "palo alto", "firewall", "iam", "pam", "mfa",
@@ -81,16 +93,18 @@ SKILL_CATEGORIES = {
     "Data Science & Visualization": [
         "machine learning", "deep learning", "tensorflow", "pytorch",
         "pandas", "numpy", "tableau", "power bi", "grafana", "prometheus",
-        "elk stack", "kibana", "data visualization"
+        "elk stack", "kibana", "data visualization", "bi reporting"
     ],
     "Other Tools": [
-        "jira", "confluence", "servicenow", "git", "agile", "scrum", "kanban",
-        "waterfall", "itil", "pmp", "project management", "linux", "unix", "rhel",
-        "ubuntu", "centos", "windows server", "vmware", "hyper-v"
+        "jira", "confluence", "servicenow", "git", "github", "agile", "scrum",
+        "kanban", "waterfall", "itil", "pmp", "project management", "linux",
+        "unix", "rhel", "ubuntu", "centos", "windows server", "vmware", "hyper-v",
+        "putty", "pycharm", "hp alm", "zephyr"
     ],
     "Business Domains": [
         "banking", "finance", "financial services", "telecom", "telecommunications",
-        "healthcare", "pharma", "insurance", "retail", "e-commerce"
+        "healthcare", "pharma", "insurance", "retail", "e-commerce", "crm",
+        "bss", "oss", "billing", "payment"
     ]
 }
 
@@ -113,6 +127,8 @@ class ExperienceEntry:
     duration_months: int
     responsibilities: List[str] = field(default_factory=list)
     tools: List[str] = field(default_factory=list)
+    project: str = ""
+    client: str = ""
 
 
 # ============================================================================
@@ -137,18 +153,18 @@ class ParseResumeInput(BaseModel):
 # ============================================================================
 
 def normalize_text(text: str) -> str:
-    """Clean and normalize resume text."""
+    """Clean and normalize resume text - enterprise grade."""
     if not text:
         return ""
     
-    # Normalize unicode characters
+    # Normalize unicode
     text = text.replace('\u2013', '-').replace('\u2014', '-').replace('–', '-')
     text = text.replace('\u2019', "'").replace('\u2018', "'")
     text = text.replace('\u201c', '"').replace('\u201d', '"')
     text = text.replace('\u2022', '•').replace('\u00a0', ' ')
     text = text.replace('\r\n', '\n').replace('\r', '\n').replace('\t', ' ')
     
-    # Fix common PDF extraction issues
+    # Fix common PDF issues
     text = re.sub(r'Pres\s*ent', 'Present', text, flags=re.IGNORECASE)
     text = re.sub(r'US\s*A', 'USA', text)
     
@@ -159,12 +175,23 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+def clean_output_text(text: str) -> str:
+    """Clean text for final output - remove artifacts."""
+    if not text:
+        return ""
+    # Remove literal \n
+    text = text.replace('\\n', ' ')
+    # Clean multiple spaces
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
 # ============================================================================
 # CONTACT EXTRACTION
 # ============================================================================
 
 def extract_contact(text: str) -> Dict[str, str]:
-    """Extract contact information from resume."""
+    """Extract contact information."""
     contact = {'email': '', 'phone': '', 'linkedin': '', 'location': ''}
     
     # Email
@@ -172,31 +199,41 @@ def extract_contact(text: str) -> Dict[str, str]:
     if match:
         contact['email'] = match.group(1).lower()
     
-    # Phone - multiple formats
+    # Phone
     phone_patterns = [
+        r'(?:Mob|Phone|Tel|Mobile)[:\s]*(\+?[\d\s\-().]{10,})',
         r'(\+1\s*\(\d{3}\)\s*\d{3}[-.\s]?\d{4})',
         r'(\(\d{3}\)\s*\d{3}[-.\s]?\d{4})',
         r'(\+\d{1,3}[-.\s]?\d{3}[-.\s]?\d{3}[-.\s]?\d{4})',
+        r'(\d{10})',
         r'(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})',
     ]
     for pattern in phone_patterns:
-        match = re.search(pattern, text)
+        match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            contact['phone'] = match.group(1)
-            break
+            phone = re.sub(r'[^\d+\-() ]', '', match.group(1)).strip()
+            if len(re.sub(r'\D', '', phone)) >= 10:
+                contact['phone'] = phone
+                break
     
-    # LinkedIn
-    match = re.search(r'linkedin\.com/in/([\w-]+)', text, re.IGNORECASE)
-    if match:
-        contact['linkedin'] = f"www.linkedin.com/in/{match.group(1)}"
-    elif re.search(r'LinkedIn[:\s]+([\w]+)', text):
-        match = re.search(r'LinkedIn[:\s]+([\w]+)', text)
-        if match and match.group(1).lower() not in ['summary', 'profile', 'in']:
-            contact['linkedin'] = f"www.linkedin.com/in/{match.group(1)}"
+    # LinkedIn - multiple patterns
+    linkedin_patterns = [
+        r'linkedin\.com/in/([\w-]+)',
+        r'linkedin[:\s]+(?:www\.)?linkedin\.com/in/([\w-]+)',
+        r'LinkedIn[:\s]+([\w]+)(?:\s|$)',
+    ]
+    for pattern in linkedin_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            username = match.group(1)
+            # Skip if it's a generic word
+            if username.lower() not in ['summary', 'profile', 'in', 'phone', 'email']:
+                contact['linkedin'] = f"www.linkedin.com/in/{username}"
+                break
     
     # Location
     loc_patterns = [
-        r'(Philadelphia|Chicago|Dallas|Plano|New York|Bangalore|Bengaluru|Hyderabad)[,\s]+(PA|TX|IL|NY|CA|India|USA|Karnataka)',
+        r'(Philadelphia|Chicago|Dallas|Plano|New York|Bangalore|Bengaluru|Hyderabad|Pune|Mumbai)[,\s]+(PA|TX|IL|NY|CA|India|USA|Karnataka|Maharashtra)',
         r'\b([A-Z][a-z]+),\s*([A-Z]{2})\b',
     ]
     for pattern in loc_patterns:
@@ -209,20 +246,20 @@ def extract_contact(text: str) -> Dict[str, str]:
 
 
 # ============================================================================
-# NAME EXTRACTION
+# NAME & TITLE EXTRACTION
 # ============================================================================
 
 def extract_name(text: str) -> Tuple[str, str, str]:
-    """Extract first, middle, last name from resume header."""
-    lines = [l.strip() for l in text.split('\n') if l.strip()][:10]
+    """Extract first, middle, last name."""
+    lines = [l.strip() for l in text.split('\n') if l.strip()][:15]
     
     for line in lines:
-        # Skip headers and contact lines
+        # Skip headers
         if line.lower() in ['resume', 'cv', 'curriculum vitae']:
             continue
-        if re.search(r'@|linkedin|phone|email|\d{3}[-.\s]\d{3}', line, re.IGNORECASE):
+        if re.search(r'@|linkedin|phone|email|mob:|\d{3}[-.\s]\d{3}', line, re.IGNORECASE):
             continue
-        if re.match(r'^(Summary|Skills|Experience|Education)', line, re.IGNORECASE):
+        if re.match(r'^(Summary|Skills|Experience|Education|Core|Technical)', line, re.IGNORECASE):
             continue
         
         # Clean line
@@ -230,7 +267,7 @@ def extract_name(text: str) -> Tuple[str, str, str]:
         name = re.sub(r'[\|,].*$', '', name).strip()
         
         parts = name.split()
-        if len(parts) >= 2 and all(p[0].isupper() for p in parts if p):
+        if 2 <= len(parts) <= 4 and all(p[0].isupper() for p in parts if p):
             if len(parts) == 2:
                 return parts[0], "", parts[1]
             elif len(parts) == 3:
@@ -241,12 +278,49 @@ def extract_name(text: str) -> Tuple[str, str, str]:
     return "", "", ""
 
 
+def extract_title(text: str, experiences: List[ExperienceEntry]) -> str:
+    """Extract professional title from summary or experience."""
+    
+    # Try from most recent job title first (most reliable)
+    if experiences:
+        title = experiences[0].title
+        if title and len(title) > 3:
+            # Remove location from title
+            title = re.sub(r'\s+(Philadelphia|Chicago|Dallas|Plano|Bangalore|Bengaluru|Hyderabad|North Chicago|India|USA|Karnataka)[,\s]*(?:PA|TX|IL|NY|CA|USA|India)?$', '', title, flags=re.IGNORECASE)
+            return clean_output_text(title)
+    
+    # Try from summary patterns
+    summary_patterns = [
+        r'(\d+\+?\s+[Yy]ears?\s+(?:of\s+)?experience\s+(?:in|as)\s+)([\w\s]+?)(?:\.|including|,)',
+        r'^([\w\s]+(?:Engineer|Developer|Manager|Analyst|Consultant|Lead|Architect|Specialist|Tester))',
+    ]
+    
+    # Find summary section
+    summary_match = re.search(r'(?:EXPERIENCE\s+)?SUMMARY[:\s]*\n(.+?)(?:\n[A-Z]{2,}|\Z)', text, re.IGNORECASE | re.DOTALL)
+    if summary_match:
+        summary = summary_match.group(1)
+        for pattern in summary_patterns:
+            match = re.search(pattern, summary, re.IGNORECASE)
+            if match:
+                # Get the role part
+                if match.lastindex and match.lastindex >= 2:
+                    role = match.group(2).strip()
+                else:
+                    role = match.group(1).strip()
+                # Clean it up
+                role = re.sub(r'^(PROFESSIONAL\s+SUMMARY\s*)', '', role, flags=re.IGNORECASE)
+                if 'Engineer' in role or 'Manager' in role or 'Consultant' in role or 'Developer' in role or 'Analyst' in role or 'Tester' in role:
+                    return clean_output_text(role[:60])
+    
+    return ""
+
+
 # ============================================================================
 # DATE PARSING
 # ============================================================================
 
 def parse_date(text: str) -> Tuple[Optional[int], Optional[int], bool]:
-    """Parse date string, returns (year, month, is_present)."""
+    """Parse date string to (year, month, is_present)."""
     if not text:
         return None, None, False
     
@@ -280,258 +354,223 @@ def calculate_duration(start_year: int, start_month: int, end_year: int, end_mon
 
 
 # ============================================================================
-# EXPERIENCE EXTRACTION - Multiple Format Support
+# EXPERIENCE EXTRACTION - ENTERPRISE GRADE
 # ============================================================================
 
 def extract_experiences(text: str) -> List[ExperienceEntry]:
-    """Extract work experiences from resume - handles multiple formats."""
+    """Extract work experiences - handles multiple formats."""
     experiences = []
     
-    # Full date range pattern
+    # Strategy 1: "Worked as X in Y from A to B" format
+    worked_pattern = r'[Ww]ork(?:ed|ing)\s+(?:as\s+)?(?:a\s+)?(.+?)\s+in\s+(.+?)\s+from\s+(\w+\s+\d{4})\s+to\s+(\w+\s+\d{4}|Present|Current)'
+    for match in re.finditer(worked_pattern, text, re.IGNORECASE):
+        title = match.group(1).strip()
+        employer = match.group(2).strip()
+        start_year, start_month, _ = parse_date(match.group(3))
+        end_year, end_month, is_present = parse_date(match.group(4))
+        
+        if start_year and end_year:
+            duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
+            start_date = f"{start_year}-{(start_month or 1):02d}"
+            end_date = f"{end_year}-{(end_month or 12):02d}" if not is_present else f"{datetime.now().year}-{datetime.now().month:02d}"
+            
+            experiences.append(ExperienceEntry(
+                employer=employer,
+                title=title,
+                location="",
+                start_date=start_date,
+                end_date=end_date,
+                duration_months=duration
+            ))
+    
+    # Strategy 2: Line-by-line date range detection
     date_range_pattern = r'((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})\s*[-–]\s*((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|Present|Current)'
     
     lines = text.split('\n')
-    
     i = 0
+    
     while i < len(lines):
         line = lines[i].strip()
-        
-        # Look for lines containing date ranges
         date_match = re.search(date_range_pattern, line, re.IGNORECASE)
         
         if date_match:
-            start_str = date_match.group(1)
-            end_str = date_match.group(2)
-            
+            start_str, end_str = date_match.group(1), date_match.group(2)
             start_year, start_month, _ = parse_date(start_str)
             end_year, end_month, is_present = parse_date(end_str)
             
             if start_year and end_year:
-                employer, title, location = "", "", ""
+                employer, title, location, client = "", "", "", ""
                 
-                # Check for pipe separator (Jimmy format): "Title | Date" with company on previous line
-                # Example: "Senior Technical Manager – Cognizant Infra Services | Jan 2023 – Jun 2025"
-                if '|' in line and date_match.start() > 0:
+                # Check for pipe format: "Title | Date"
+                if '|' in line:
                     pipe_idx = line.rfind('|')
-                    title = line[:pipe_idx].strip()
-                    title = re.sub(r'\s*[-–]\s*[\w\s]+$', '', title)  # Remove client name if present
+                    title_part = line[:pipe_idx].strip()
                     
-                    # Look at previous line for company
+                    # Extract client if present: "Title | Client: X | Date"
+                    client_match = re.search(r'Client[:\s]+([^|]+)', title_part, re.IGNORECASE)
+                    if client_match:
+                        client = client_match.group(1).strip()
+                    
+                    # Clean title
+                    title = re.sub(r'\s*[-–]\s*.*$', '', title_part.split('|')[0]).strip()
+                    
+                    # Previous line is company
                     if i > 0:
                         prev_line = lines[i - 1].strip()
-                        # Pattern: "Company – Location"
-                        comp_match = re.match(r'^([A-Za-z][\w\s&.,()]+?)\s*[-–]\s*(.+)$', prev_line)
-                        if comp_match:
-                            employer = comp_match.group(1).strip()
-                            location = comp_match.group(2).strip()
+                        loc_match = re.search(r'[-–]\s*(.+)$', prev_line)
+                        if loc_match:
+                            employer = prev_line[:prev_line.find('-')].strip()
+                            location = loc_match.group(1).strip()
                         else:
                             employer = prev_line
                 else:
-                    # Original format: Company – Title Location Date on same line
-                    header_part = line[:date_match.start()].strip()
+                    # Standard format: "Company – Title Location Date"
+                    header = line[:date_match.start()].strip()
                     
-                    # Format 1: "Company – Title Location" before date
-                    comp_match = re.match(
-                        r'^([A-Za-z][\w\s&.,()]+?)\s*[-–]\s*(.+?)\s+((?:Philadelphia|Chicago|Dallas|Plano|New York|Bangalore|Bengaluru|Hyderabad|North Chicago)[,\s]*(?:PA|TX|IL|NY|CA|USA|India|Karnataka)?)\s*$',
-                        header_part
-                    )
+                    comp_match = re.match(r'^([A-Za-z][\w\s&.,()]+?)\s*[-–]\s*(.+?)\s+((?:Philadelphia|Chicago|Dallas|Plano|Bangalore|Bengaluru|Hyderabad|North Chicago)[,\s]*(?:PA|TX|IL|NY|CA|USA|India|Karnataka)?)\s*$', header)
                     if comp_match:
                         employer = comp_match.group(1).strip()
                         title = comp_match.group(2).strip()
                         location = comp_match.group(3).strip()
                     else:
-                        # Format 2: Just "Company" on this line, title on next
-                        employer = header_part.strip()
+                        # Company might be on this line, title on next
+                        employer = header.strip()
                         if i + 1 < len(lines):
                             next_line = lines[i + 1].strip()
-                            if not next_line.startswith(('•', '-', '*')) and len(next_line) < 150:
-                                if not re.search(date_range_pattern, next_line, re.IGNORECASE):
-                                    loc_match = re.search(
-                                        r'((?:Philadelphia|Chicago|Dallas|Plano|Bangalore|Bengaluru|Hyderabad|North Chicago)[,\s]*(?:PA|TX|IL|NY|CA|USA|India|Karnataka)?)\s*$',
-                                        next_line, re.IGNORECASE
-                                    )
-                                    if loc_match:
-                                        title = next_line[:loc_match.start()].strip()
-                                        location = loc_match.group(1).strip()
-                                    else:
-                                        title = next_line
-                                    i += 1
+                            if not re.search(date_range_pattern, next_line) and not next_line.startswith(('•', '-', '*')):
+                                loc_match = re.search(r'((?:Philadelphia|Chicago|Bangalore|Hyderabad)[,\s]*(?:PA|TX|India|Karnataka)?)\s*$', next_line, re.IGNORECASE)
+                                if loc_match:
+                                    title = next_line[:loc_match.start()].strip()
+                                    location = loc_match.group(1).strip()
+                                else:
+                                    title = next_line
+                                i += 1
                 
-                # Clean up employer name
+                # Clean employer
                 employer = re.sub(r'\s*[-–].*$', '', employer).strip()
                 
                 # Get responsibilities
                 responsibilities = []
-                tools = []
                 j = i + 1
-                while j < len(lines) and j < i + 25:
+                while j < len(lines) and j < i + 30:
                     resp_line = lines[j].strip()
                     
+                    # Stop conditions
                     if re.search(date_range_pattern, resp_line, re.IGNORECASE):
                         break
-                    if re.match(r'^(EDUCATION|TECHNICAL|SKILLS|CERTIFICATIONS|KEY\s+ARCH)', resp_line, re.IGNORECASE):
+                    if re.match(r'^(EDUCATION|TECHNICAL|SKILLS|CERTIFICATIONS|PERSONAL|KEY\s+ARCH|PROFESSIONAL\s+EXPERIENCE)', resp_line, re.IGNORECASE):
                         break
-                    # Skip company/title lines
-                    if re.match(r'^[A-Z][A-Za-z\s&]+[-–]', resp_line):
+                    if re.match(r'^[A-Z][A-Za-z\s&]+[-–]\s*[A-Z]', resp_line):  # New company line
                         break
                     
-                    if resp_line.startswith(('•', '-', '*', '–')):
-                        resp_text = re.sub(r'^[•\-\*–]\s*', '', resp_line)
-                        if len(resp_text) > 30:
-                            responsibilities.append(resp_text)
+                    # Extract bullet points
+                    if resp_line.startswith(('•', '-', '*', '–')) or re.match(r'^\d+\.', resp_line):
+                        resp_text = re.sub(r'^[•\-\*–\d.]\s*', '', resp_line)
+                        if len(resp_text) > 20:
+                            responsibilities.append(clean_output_text(resp_text))
                     
                     j += 1
                 
-                tools = extract_tools_from_text(' '.join(responsibilities))
+                # Calculate duration
                 duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
-                
                 start_date = f"{start_year}-{(start_month or 1):02d}"
-                if is_present:
-                    now = datetime.now()
-                    end_date = f"{now.year}-{now.month:02d}"
-                else:
-                    end_date = f"{end_year}-{(end_month or 12):02d}"
+                end_date = f"{end_year}-{(end_month or 12):02d}" if not is_present else f"{datetime.now().year}-{datetime.now().month:02d}"
+                
+                # Extract tools from responsibilities
+                tools = extract_tools_from_text(' '.join(responsibilities))
                 
                 if employer or title:
-                    experiences.append(ExperienceEntry(
-                        employer=employer,
-                        title=title,
-                        location=location,
-                        start_date=start_date,
-                        end_date=end_date,
-                        duration_months=duration,
-                        responsibilities=responsibilities[:10],
-                        tools=tools
-                    ))
-        
+                    # Clean title - remove location if appended
+                    title = re.sub(r'\s+(Philadelphia|Chicago|Dallas|Plano|Bangalore|Bengaluru|Hyderabad|North Chicago)[,\s]*(?:PA|TX|IL|NY|CA|USA|India|Karnataka)?$', '', title, flags=re.IGNORECASE)
+                    
+                    # Check if this is a duplicate
+                    is_dup = any(
+                        e.employer == employer and e.start_date == start_date
+                        for e in experiences
+                    )
+                    if not is_dup:
+                        experiences.append(ExperienceEntry(
+                            employer=employer,
+                            title=title.strip(),
+                            location=location,
+                            start_date=start_date,
+                            end_date=end_date,
+                            duration_months=duration,
+                            responsibilities=responsibilities[:12],
+                            tools=tools,
+                            client=client
+                        ))
         i += 1
     
-    # Try "Worked as" format if no experiences found
-    if not experiences:
-        worked_pattern = r'[Ww]orked\s+as\s+(?:a\s+)?(.+?)\s+in\s+(.+?)\s+from\s+(\w+\s+\d{4})\s+to\s+(\w+\s+\d{4}|Present)'
-        for match in re.finditer(worked_pattern, text):
-            title, employer = match.group(1).strip(), match.group(2).strip()
-            start_year, start_month, _ = parse_date(match.group(3))
-            end_year, end_month, is_present = parse_date(match.group(4))
-            
-            if start_year and end_year:
-                duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
-                experiences.append(ExperienceEntry(
-                    employer=employer, title=title, location="",
-                    start_date=f"{start_year}-{(start_month or 1):02d}",
-                    end_date=f"{end_year}-{(end_month or 12):02d}",
-                    duration_months=duration, responsibilities=[], tools=[]
-                ))
+    # Strategy 3: Detailed work experience section with company headers
+    if not experiences or all(len(e.responsibilities) == 0 for e in experiences):
+        experiences = extract_detailed_experiences(text, experiences)
+    
+    # Sort by start date descending
+    experiences.sort(key=lambda x: x.start_date, reverse=True)
     
     return experiences
 
 
-def parse_job_header(text: str) -> Tuple[str, str, str]:
-    """Parse employer, title, location from job header - handles multiple formats."""
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
+def extract_detailed_experiences(text: str, existing: List[ExperienceEntry]) -> List[ExperienceEntry]:
+    """Extract from detailed WORK EXPERIENCE section with project info."""
     
-    employer, title, location = "", "", ""
+    # Find work experience section
+    work_match = re.search(r'WORK\s+EXPERIENCE[:\s]*\n(.+?)(?:\nPERSONAL|\nEDUCATION|\Z)', text, re.IGNORECASE | re.DOTALL)
+    if not work_match:
+        return existing
     
-    # Get last few relevant lines before the date
-    relevant_lines = []
-    for line in lines[-10:]:
-        # Skip bullet points, long lines, and section headers
-        if line.startswith(('•', '-', '*')) or len(line) > 200:
+    work_section = work_match.group(1)
+    
+    # Pattern for company blocks
+    # e.g., "Tech Mahindra" or "Synechron Technologies Pvt. Ltd."
+    company_pattern = r'^([A-Z][A-Za-z\s&.,()]+(?:Ltd|Inc|Corp|Technologies|Solutions|Pvt|Group)?\.?)\s*$'
+    
+    lines = work_section.split('\n')
+    current_company = ""
+    current_title = ""
+    current_client = ""
+    current_responsibilities = []
+    
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
             continue
-        if re.match(r'^(WORK|EXPERIENCE|EDUCATION|SKILLS|CERTIFICATIONS)', line, re.IGNORECASE):
+        
+        # Check for company line
+        if re.match(company_pattern, line, re.IGNORECASE):
+            current_company = line
             continue
-        relevant_lines.append(line)
-    
-    if not relevant_lines:
-        return "", "", ""
-    
-    # Pattern 1: "Company – Title Location" all on one line (Sudheer format)
-    # Example: "Comcast – Manager, DevOps, Data & Cloud Philadelphia, PA"
-    for line in relevant_lines:
-        match = re.match(
-            r'^([A-Za-z][\w\s&.,()]+?)\s*[-–]\s*([A-Za-z][\w\s,&]+?)\s+((?:Philadelphia|Chicago|Dallas|Plano|New York|Bangalore|Bengaluru|Hyderabad|India)[,\s]+(?:PA|TX|IL|NY|CA|USA|India|Karnataka)?)$',
-            line
-        )
-        if match:
-            return match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
-    
-    # Pattern 2: Company on first line, Title on second (Khaliq format)
-    # Example: "Abbott Laboratories" then "IT Project Manager Chicago, USA"
-    company_indicators = ['inc', 'ltd', 'llc', 'corp', 'technologies', 'solutions', 
-                         'services', 'systems', 'laboratories', 'consultancy', 'pvt', 'tcs']
-    
-    for i, line in enumerate(relevant_lines):
-        line_lower = line.lower()
         
-        # Check if this is a company line
-        is_company = (
-            any(ci in line_lower for ci in company_indicators) or
-            re.match(r'^[A-Z][A-Za-z\s&]+$', line.split('–')[0].split('-')[0].strip())
-        )
+        # Check for title/client line: "Title | Client: X | Project: Y"
+        if '|' in line and 'Client' in line:
+            parts = line.split('|')
+            current_title = parts[0].strip()
+            for part in parts[1:]:
+                if 'Client' in part:
+                    current_client = re.sub(r'Client[:\s]*', '', part).strip()
+            continue
         
-        if is_company and i + 1 < len(relevant_lines):
-            employer = line.split('–')[0].split(' - ')[0].strip()
-            title_line = relevant_lines[i + 1]
-            
-            # Extract location from title line
-            loc_match = re.search(
-                r'((?:Philadelphia|Chicago|Dallas|Plano|New York|Bangalore|Bengaluru|Hyderabad|North Chicago)[,\s]+(?:PA|TX|IL|NY|CA|USA|India|Karnataka)?)',
-                title_line, re.IGNORECASE
-            )
-            if loc_match:
-                title = title_line[:loc_match.start()].strip()
-                location = loc_match.group(1).strip()
-            else:
-                title = title_line.strip()
-            
-            return employer, title, location
-    
-    # Pattern 3: Combined format "Company – Title, Location Date"
-    # Example: "Vsion Technologies Inc – NoSQL Database Admin Philadelphia, PA Feb 2016"
-    for line in relevant_lines:
-        # Remove date part first
-        line_clean = re.sub(r'\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}.*$', '', line, flags=re.IGNORECASE)
+        # Check for "Key Responsibilities:" header
+        if re.match(r'^Key\s+Responsibilities', line, re.IGNORECASE):
+            continue
         
-        match = re.match(r'^([A-Za-z][\w\s&.,()]+?)\s*[-–]\s*(.+)$', line_clean)
-        if match:
-            employer = match.group(1).strip()
-            title_loc = match.group(2).strip()
-            
-            # Try to separate title and location
-            loc_match = re.search(
-                r'((?:Philadelphia|Chicago|Dallas|Plano|Bangalore|Hyderabad|India)[,\s]+(?:PA|TX|IL|NY|CA|USA|India|Karnataka)?)$',
-                title_loc, re.IGNORECASE
-            )
-            if loc_match:
-                title = title_loc[:loc_match.start()].strip()
-                location = loc_match.group(1).strip()
-            else:
-                title = title_loc
-            
-            if employer and title:
-                return employer, title, location
+        # Bullet points are responsibilities
+        if line.startswith(('•', '-', '*')) or re.match(r'^\d+\.', line):
+            resp = re.sub(r'^[•\-\*\d.]\s*', '', line)
+            if len(resp) > 20:
+                current_responsibilities.append(clean_output_text(resp))
     
-    # Fallback: use last non-empty lines
-    if len(relevant_lines) >= 2:
-        return relevant_lines[-2], relevant_lines[-1], ""
-    elif relevant_lines:
-        return relevant_lines[-1], "", ""
+    # Update existing experiences with responsibilities
+    for exp in existing:
+        if not exp.responsibilities:
+            # Find matching responsibilities
+            for resp in current_responsibilities:
+                if any(tool.lower() in resp.lower() for tool in exp.tools) or len(exp.responsibilities) < 5:
+                    if resp not in exp.responsibilities:
+                        exp.responsibilities.append(resp)
     
-    return "", "", ""
-
-
-def extract_bullets(text: str) -> List[str]:
-    """Extract bullet point responsibilities."""
-    bullets = []
-    parts = re.split(r'(?:^|\n)\s*[•·▪▸►●○◆◇→\-\*]\s*', text)
-    
-    for part in parts:
-        part = re.sub(r'\s+', ' ', part.strip())
-        # Skip short entries and date-like entries
-        if len(part) > 40 and not re.match(r'^[A-Z][a-z]+\s+\d{4}', part):
-            bullets.append(part)
-    
-    return bullets
+    return existing
 
 
 def extract_tools_from_text(text: str) -> List[str]:
@@ -542,10 +581,11 @@ def extract_tools_from_text(text: str) -> List[str]:
     tool_list = [
         'python', 'java', 'javascript', 'sql', 'aws', 'azure', 'gcp',
         'docker', 'kubernetes', 'terraform', 'ansible', 'jenkins',
-        'mongodb', 'cassandra', 'redis', 'postgresql', 'mysql',
+        'mongodb', 'cassandra', 'redis', 'postgresql', 'mysql', 'oracle',
         'kafka', 'spark', 'airflow', 'prometheus', 'grafana', 'elk stack',
         'react', 'angular', 'node.js', 'linux', 'jira', 'servicenow',
-        'sonarqube', 'qualys', 'palo alto', 'vmware', 'splunk'
+        'selenium', 'pytest', 'postman', 'git', 'tableau', 'power bi',
+        'informatica', 'cucumber', 'behave', 'pycharm', 'unix'
     ]
     
     for tool in tool_list:
@@ -560,12 +600,12 @@ def extract_tools_from_text(text: str) -> List[str]:
 # ============================================================================
 
 def extract_education(text: str) -> List[Dict[str, str]]:
-    """Extract education entries."""
+    """Extract education - handles multiple formats."""
     education = []
     
     # Find education section
     edu_match = re.search(
-        r'EDUCATION[:\s]*\n(.+?)(?:\nTECHNICAL|\nROLES|\nPROJECT|\nKEY|\n_+|\Z)',
+        r'EDUCATION(?:AL)?\s*(?:QUALIFICATION)?[:\s]*\n(.+?)(?:\nROLES|\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nPERSONAL|\nCERTIFI|\nCORE|\nAS\s+A\s+SCRUM|\Z)',
         text, re.IGNORECASE | re.DOTALL
     )
     
@@ -573,52 +613,94 @@ def extract_education(text: str) -> List[Dict[str, str]]:
         return education
     
     edu_section = edu_match.group(1)
-    lines = edu_section.split('\n')
     
-    current_entry = {}
-    for line in lines:
+    for line in edu_section.split('\n'):
         line = line.strip()
-        if not line or len(line) < 3:
+        if not line or len(line) < 5:
             continue
         
         # Skip irrelevant lines
-        if re.match(r'^(Roles|Project|•|-|\*)', line, re.IGNORECASE):
+        if re.match(r'^(Worked|Working|•|-|\*|PROFESSIONAL|Roles|As\s+a\s+Scrum|Facilitate|Remove|Coach|Shield|Foster)', line, re.IGNORECASE):
             continue
         
-        # Pattern: "Degree | Institution | Year"
-        if '|' in line:
-            parts = [p.strip() for p in line.split('|')]
-            if len(parts) >= 2:
-                entry = {'degree': parts[0], 'institution': parts[1]}
+        # Skip lines that look like responsibilities
+        if 'responsibilities' in line.lower() or 'impediments' in line.lower():
+            continue
+        
+        entry = {}
+        
+        # Format 1: "Degree From Institution Year"
+        from_match = re.match(r'^(.+?)\s+[Ff]rom\s+(.+?)\s+(?:\w+\s+)?(\d{4})$', line)
+        if from_match:
+            entry['degree'] = from_match.group(1).strip()
+            entry['institution'] = from_match.group(2).strip()
+            entry['year'] = from_match.group(3)
+            education.append(entry)
+            continue
+        
+        # Format 2: "Degree | Institution | Year" or with year range
+        pipe_match = re.match(r'^(.+?)\s*\|\s*(.+?)$', line)
+        if pipe_match:
+            degree_part = pipe_match.group(1).strip()
+            rest = pipe_match.group(2).strip()
+            
+            # Skip if degree part doesn't look like education
+            if not any(kw in degree_part.lower() for kw in ['master', 'bachelor', 'mba', 'mca', 'bca', 'b.tech', 'm.tech', 'b.e', 'm.e', 'ph.d', 'degree', 'science', 'engineering', 'arts']):
+                continue
+            
+            # Check if rest contains year range
+            year_range_match = re.search(r'(\d{4})\s*[-–]\s*(\d{4})', rest)
+            if year_range_match:
+                entry['degree'] = degree_part
+                entry['year'] = year_range_match.group(2)
+                
+                # Try to extract institution from degree part
+                inst_match = re.search(r'[-–]\s*(.+)$', degree_part)
+                if inst_match:
+                    entry['institution'] = inst_match.group(1).strip()
+                    entry['degree'] = degree_part[:degree_part.find('-')].strip()
+            else:
+                entry['degree'] = degree_part
+                entry['institution'] = rest
                 year_match = re.search(r'(\d{4})', line)
                 if year_match:
                     entry['year'] = year_match.group(1)
+            
+            if entry.get('degree'):
                 education.append(entry)
-                continue
-        
-        # Pattern: Institution with date range
-        date_match = re.search(r'(\w+\s+\d{4})\s*[-–]\s*(\w+\s+\d{4})', line)
-        if date_match:
-            inst_match = re.search(r'^(University|[\w\s]+University|JNT\s+University|[\w\s]+Institute)', line, re.IGNORECASE)
-            if inst_match:
-                current_entry['institution'] = inst_match.group(1).strip()
-                year_match = re.search(r'(\d{4})$', line)
-                if year_match:
-                    current_entry['year'] = year_match.group(1)
             continue
         
-        # Degree line (follows institution)
-        degree_keywords = ['master', 'bachelor', 'mba', 'mca', 'bca', 'b.tech', 'm.tech', 'b.e', 'm.e', 'ph.d']
+        # Format 3: Institution name with date range (split across lines)
+        inst_match = re.match(r'^(University\s+of\s+\w+|[\w\s]+University|JNT\s+University)', line, re.IGNORECASE)
+        if inst_match:
+            entry['institution'] = inst_match.group(1).strip()
+            year_match = re.search(r'(\d{4})', line)
+            if year_match:
+                entry['year'] = year_match.group(1)
+            # Degree will be on next line - we'll handle this case separately
+            education.append(entry)
+            continue
+        
+        # Format 4: Degree keywords on single line
+        degree_keywords = ['master', 'bachelor', 'mba', 'mca', 'bca', 'b.tech', 'm.tech', 'b.e', 'm.e', 'ph.d', 'me ', 'be ']
         if any(kw in line.lower() for kw in degree_keywords):
-            if current_entry.get('institution'):
-                current_entry['degree'] = line.strip()
-                education.append(current_entry.copy())
-                current_entry = {}
+            # Try to parse "Degree - Institution"
+            parts = re.split(r'\s*[-–]\s*', line, maxsplit=1)
+            entry['degree'] = parts[0].strip()
+            
+            if len(parts) > 1:
+                rest = parts[1]
+                year_match = re.search(r'[|,]\s*(?:\d{4}\s*[-–]\s*)?(\d{4})\s*$', rest)
+                if year_match:
+                    entry['year'] = year_match.group(1)
+                    entry['institution'] = rest[:year_match.start()].strip().rstrip(',|')
+                else:
+                    entry['institution'] = rest
+                    year_match = re.search(r'(\d{4})', line)
+                    if year_match:
+                        entry['year'] = year_match.group(1)
             else:
-                # Institution and degree on same or nearby lines
-                entry = {'degree': line.split('-')[0].split('|')[0].strip()}
-                # Look for institution
-                for pattern in [r'(University[\w\s,]+)', r'([\w\s]+University)', r'(IGNOU|Pondicherry|Texas A&M)']:
+                for pattern in [r'(University[\w\s,]+)', r'([\w\s]+University)', r'(IGNOU|Pondicherry|Texas A&M|Pune)']:
                     match = re.search(pattern, line, re.IGNORECASE)
                     if match:
                         entry['institution'] = match.group(1).strip()
@@ -626,13 +708,28 @@ def extract_education(text: str) -> List[Dict[str, str]]:
                 year_match = re.search(r'(\d{4})', line)
                 if year_match:
                     entry['year'] = year_match.group(1)
+            
+            if entry.get('degree'):
                 education.append(entry)
     
-    # Add any remaining entry
-    if current_entry.get('institution') or current_entry.get('degree'):
-        education.append(current_entry)
+    # Clean up - merge institution-only entries with degree-only entries
+    cleaned = []
+    for i, edu in enumerate(education):
+        if edu.get('degree') and not edu.get('institution'):
+            # Check if next entry has institution only
+            if i + 1 < len(education) and education[i+1].get('institution') and not education[i+1].get('degree'):
+                edu['institution'] = education[i+1]['institution']
+                if education[i+1].get('year'):
+                    edu['year'] = education[i+1]['year']
+                cleaned.append(edu)
+                education[i+1] = {}  # Mark as used
+            else:
+                cleaned.append(edu)
+        elif edu.get('institution') or edu.get('degree'):
+            if edu:  # Not marked as used
+                cleaned.append(edu)
     
-    return education
+    return [e for e in cleaned if e]
 
 
 # ============================================================================
@@ -643,21 +740,64 @@ def extract_certifications(text: str) -> List[str]:
     """Extract certifications."""
     certifications = []
     
-    cert_match = re.search(
-        r'CERTIFICATIONS?\s*(?:&\s*LEARNING)?[:\s]*\n(.+?)(?:\nWORK|\nEXPERIENCE|\nSKILLS|\nPROJECT|\Z)',
-        text, re.IGNORECASE | re.DOTALL
-    )
+    # Multiple section patterns
+    cert_patterns = [
+        r'CERTIFICATIONS?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nEDUCATION|\nSKILLS|\Z)',
+        r'CERTIFICATES?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\Z)',
+    ]
     
-    if cert_match:
-        for line in cert_match.group(1).split('\n'):
+    cert_section = ""
+    for pattern in cert_patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            cert_section = match.group(1)
+            break
+    
+    if cert_section:
+        for line in cert_section.split('\n'):
             line = re.sub(r'^[•·\-\*]\s*', '', line.strip())
-            if line and 5 < len(line) < 150:
-                if not any(h in line.lower() for h in ['certification', 'learning', 'work experience']):
-                    line = re.sub(r'\s*[-–]\s*(?:In Progress|Certification in Progress)\.?$', '', line, flags=re.IGNORECASE)
-                    if line:
-                        certifications.append(line)
+            if line and 3 < len(line) < 200:
+                # Skip section headers and experience lines
+                if re.match(r'^(PROFESSIONAL|EXPERIENCE|IMG|IBM|Cognizant|Dell|Wipro)', line, re.IGNORECASE):
+                    continue
+                
+                # Clean "In Progress" suffix
+                line = re.sub(r'\s*[-–]\s*In Progress\.?$', '', line, flags=re.IGNORECASE)
+                
+                # Split combined certifications on | 
+                if '|' in line:
+                    parts = [p.strip() for p in line.split('|')]
+                    for part in parts:
+                        if part and len(part) > 3:
+                            certifications.append(clean_output_text(part))
+                else:
+                    certifications.append(clean_output_text(line))
     
-    return list(dict.fromkeys(certifications))[:15]
+    return list(dict.fromkeys(certifications))[:20]
+
+
+# ============================================================================
+# SUMMARY EXTRACTION
+# ============================================================================
+
+def extract_summary(text: str) -> str:
+    """Extract professional summary."""
+    patterns = [
+        r'(?:PROFESSIONAL\s+)?SUMMARY[:\s]*\n(.+?)(?:\nSKILLS|\nEXPERIENCE|\nWORK|\nTECHNICAL|\nCORE|\Z)',
+        r'EXPERIENCE\s+SUMMARY[:\s]*\n(.+?)(?:\nTECHNICAL|\nSKILLS|\nPROFESSIONAL|\Z)',
+        r'TECHNICAL\s+QUALIFICATION\s+HEADLINE[:\s]*\n(.+?)(?:\nEXPERIENCE|\nSKILLS|\Z)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            summary = match.group(1).strip()
+            # Clean up
+            summary = re.sub(r'\n+', ' ', summary)
+            summary = clean_output_text(summary)
+            return summary[:2000]
+    
+    return ""
 
 
 # ============================================================================
@@ -677,9 +817,9 @@ def extract_technical_skills(text: str) -> List[str]:
 
 
 def calculate_key_skills(text: str, experiences: List[ExperienceEntry]) -> Dict[str, List[Dict]]:
-    """Calculate skills with experience months."""
+    """Calculate skills with experience months - enterprise grade."""
     key_skills = {cat: [] for cat in SKILL_CATEGORIES}
-    skill_exp: Dict[str, int] = {}
+    skill_months: Dict[str, int] = {}
     found_skills: Dict[str, str] = {}
     
     text_lower = text.lower()
@@ -688,26 +828,54 @@ def calculate_key_skills(text: str, experiences: List[ExperienceEntry]) -> Dict[
     for cat, skills in SKILL_CATEGORIES.items():
         for skill in skills:
             if re.search(rf'\b{re.escape(skill)}\b', text_lower):
-                found_skills[skill] = skill.title() if len(skill) > 3 else skill.upper()
-                skill_exp[skill] = 0
+                display_name = skill.title() if len(skill) > 3 else skill.upper()
+                found_skills[skill] = display_name
+                skill_months[skill] = 0
     
-    # Calculate from experiences
-    for exp in experiences:
-        job_text = f"{exp.title} {exp.employer} {' '.join(exp.responsibilities)} {' '.join(exp.tools)}".lower()
-        
-        for skill in found_skills:
-            if re.search(rf'\b{re.escape(skill)}\b', job_text):
-                skill_exp[skill] = skill_exp.get(skill, 0) + exp.duration_months
+    # Find which jobs mention which skills
+    # We need to look at the FULL text around each job, not just extracted responsibilities
     
-    # Build output
+    # Build job sections from text
+    job_sections = []
+    for i, exp in enumerate(experiences):
+        # Create searchable text for this job
+        exp_text = f"{exp.title} {exp.employer} {' '.join(exp.responsibilities)} {' '.join(exp.tools)} {exp.client}".lower()
+        job_sections.append((exp, exp_text))
+    
+    # For each skill, calculate total months
+    for skill in found_skills:
+        for exp, exp_text in job_sections:
+            # Check if skill appears in this job's context
+            if re.search(rf'\b{re.escape(skill)}\b', exp_text):
+                skill_months[skill] = skill_months.get(skill, 0) + exp.duration_months
+    
+    # If no experience was calculated, try to assign based on overall resume mentions
+    # and distribute across total experience
+    total_months = sum(e.duration_months for e in experiences)
+    for skill in found_skills:
+        if skill_months.get(skill, 0) == 0 and total_months > 0:
+            # Check if skill is in technical skills section or core competencies
+            # If so, assume it was used across career
+            skills_section = re.search(
+                r'(?:TECHNICAL\s+SKILLS?|CORE\s+COMPETENCIES|SKILLS)[:\s]*\n(.+?)(?:\n[A-Z]{2,}|\Z)',
+                text, re.IGNORECASE | re.DOTALL
+            )
+            if skills_section:
+                section_text = skills_section.group(1).lower()
+                if re.search(rf'\b{re.escape(skill)}\b', section_text):
+                    # Skill is listed in skills section - assign total experience
+                    skill_months[skill] = total_months
+    
+    # Build categorized output
     for cat, skills in SKILL_CATEGORIES.items():
         cat_skills = []
         for skill in skills:
             if skill in found_skills:
                 cat_skills.append({
                     "skill": found_skills[skill],
-                    "experience_months": skill_exp.get(skill, 0)
+                    "experience_months": skill_months.get(skill, 0)
                 })
+        # Sort by experience descending
         cat_skills.sort(key=lambda x: x['experience_months'], reverse=True)
         key_skills[cat] = cat_skills
     
@@ -715,69 +883,48 @@ def calculate_key_skills(text: str, experiences: List[ExperienceEntry]) -> Dict[
 
 
 # ============================================================================
-# CLAUDE AI VALIDATION - Smart Fallback for Complex Resumes
+# CLAUDE AI VALIDATION
 # ============================================================================
 
-async def validate_and_enhance_with_ai(resume_text: str, parsed_result: Dict) -> Dict:
-    """
-    Use Claude API to validate and enhance parsed results when critical data is missing.
-    This acts as a smart fallback for complex resume formats.
-    """
+async def validate_with_ai(resume_text: str, parsed: Dict) -> Dict:
+    """Use Claude API to validate and enhance parsed results."""
     if not ANTHROPIC_API_KEY:
-        return parsed_result
+        return parsed
     
-    pr = parsed_result.get('parsed_resume', {})
+    pr = parsed.get('parsed_resume', {})
     
-    # Check what's missing or suspicious
+    # Check for issues
     issues = []
     if not pr.get('firstname') or not pr.get('lastname'):
-        issues.append("name (firstname, lastname)")
-    if len(pr.get('experience', [])) < 2:
-        issues.append("work experience (need all jobs with employer, title, dates)")
-    if not pr.get('title'):
-        issues.append("professional title")
+        issues.append("name")
+    if len(pr.get('experience', [])) < 1:
+        issues.append("experience")
     if len(pr.get('education', [])) == 0:
         issues.append("education")
+    if not pr.get('title'):
+        issues.append("title")
     
-    # Only call AI if there are significant issues
     if not issues:
-        return parsed_result
+        return parsed
     
     try:
         import httpx
         
-        prompt = f"""Parse this resume and extract the missing/incomplete information. Return ONLY valid JSON.
+        prompt = f"""Extract these missing fields from the resume. Return ONLY valid JSON.
 
-MISSING DATA TO EXTRACT: {', '.join(issues)}
+Missing: {', '.join(issues)}
 
-RESUME TEXT:
-{resume_text[:12000]}
+Resume:
+{resume_text[:10000]}
 
-Return JSON with these fields (include ALL work experience entries):
+Return JSON:
 {{
   "firstname": "...",
   "lastname": "...",
-  "title": "Professional title from summary",
-  "experience": [
-    {{
-      "Employer": "Company Name",
-      "title": "Job Title",
-      "location": "City, State/Country",
-      "start_date": "YYYY-MM",
-      "end_date": "YYYY-MM",
-      "duration_months": N
-    }}
-  ],
-  "education": [
-    {{
-      "degree": "...",
-      "institution": "...",
-      "year": "YYYY"
-    }}
-  ]
-}}
-
-Important: Extract ALL jobs listed, not just the first one. Calculate duration_months accurately."""
+  "title": "Professional title",
+  "education": [{{"degree": "...", "institution": "...", "year": "YYYY"}}],
+  "experience": [{{"Employer": "...", "title": "...", "start_date": "YYYY-MM", "end_date": "YYYY-MM", "duration_months": N}}]
+}}"""
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
@@ -798,37 +945,31 @@ Important: Extract ALL jobs listed, not just the first one. Calculate duration_m
                 result = response.json()
                 content = result.get('content', [{}])[0].get('text', '{}')
                 
-                # Extract JSON from response
                 json_match = re.search(r'\{[\s\S]*\}', content)
                 if json_match:
                     ai_data = json.loads(json_match.group())
                     
-                    # Merge AI results
+                    # Merge results
                     for key in ['firstname', 'lastname', 'title']:
                         if ai_data.get(key) and not pr.get(key):
                             pr[key] = ai_data[key]
                     
-                    # Use AI experience if we got more entries
-                    ai_exp = ai_data.get('experience', [])
-                    if len(ai_exp) > len(pr.get('experience', [])):
-                        pr['experience'] = ai_exp
+                    if ai_data.get('education') and not pr.get('education'):
+                        pr['education'] = ai_data['education']
                     
-                    # Use AI education if we got entries
-                    ai_edu = ai_data.get('education', [])
-                    if ai_edu and not pr.get('education'):
-                        pr['education'] = ai_edu
+                    if ai_data.get('experience') and len(ai_data['experience']) > len(pr.get('experience', [])):
+                        pr['experience'] = ai_data['experience']
                     
-                    # Update name field
                     if pr.get('firstname') and pr.get('lastname'):
                         pr['name'] = f"{pr['firstname']} {pr['lastname']}"
                     
-                    parsed_result['ai_enhanced'] = True
-                    parsed_result['ai_issues_fixed'] = issues
+                    parsed['ai_enhanced'] = True
+                    parsed['ai_issues_fixed'] = issues
     
     except Exception as e:
-        parsed_result['ai_validation_error'] = str(e)
+        parsed['ai_error'] = str(e)
     
-    return parsed_result
+    return parsed
 
 
 # ============================================================================
@@ -836,40 +977,29 @@ Important: Extract ALL jobs listed, not just the first one. Calculate duration_m
 # ============================================================================
 
 async def parse_resume_full(params: ParseResumeInput) -> str:
-    """Parse resume and return structured JSON with optional AI validation."""
+    """Parse resume and return structured JSON - enterprise grade."""
     text = normalize_text(params.resume_text)
     
-    # Extract basic info
+    # Extract all components
     contact = extract_contact(text)
     firstname, middle, lastname = extract_name(text)
-    
-    # Extract title from summary
-    title = ""
-    summary = ""
-    summary_match = re.search(
-        r'(?:PROFESSIONAL\s+)?SUMMARY[:\s]*\n(.+?)(?:\nSKILLS|\nEXPERIENCE|\nWORK|\Z)',
-        text, re.IGNORECASE | re.DOTALL
-    )
-    if summary_match:
-        summary = summary_match.group(1).strip()[:2000]
-        # Extract title
-        for pattern in [
-            r'^([\w\s]+(?:Engineer|Manager|Architect|Developer|Lead|Director|Analyst|Consultant))',
-            r'^(IT\s+Project\s+Manager)',
-            r'^(Scrum\s+Master)',
-            r'(DevOps[\w\s,&]+Engineer)',
-        ]:
-            match = re.search(pattern, summary, re.IGNORECASE)
-            if match:
-                title = match.group(1).strip()
-                break
-    
-    # Extract experiences
     experiences = extract_experiences(text)
+    education = extract_education(text)
+    certifications = extract_certifications(text)
+    summary = extract_summary(text)
+    title = extract_title(text, experiences)
+    
+    # Build name
+    name_parts = [firstname]
+    if middle:
+        name_parts.append(middle)
+    name_parts.append(lastname)
+    name = ' '.join(filter(None, name_parts))
+    
+    # Calculate skills with experience
+    key_skills = calculate_key_skills(text, experiences)
     
     # Build result
-    name = f"{firstname} {middle} {lastname}".replace('  ', ' ').strip() if middle else f"{firstname} {lastname}"
-    
     result = {
         "parsed_resume": {
             "firstname": firstname,
@@ -881,19 +1011,22 @@ async def parse_resume_full(params: ParseResumeInput) -> str:
             "email": contact.get('email', ''),
             "linkedin": contact.get('linkedin', ''),
             "summary": summary,
+            "total_experience_months": sum(e.duration_months for e in experiences),
+            "total_experience_years": round(sum(e.duration_months for e in experiences) / 12, 1),
             "technical_skills": extract_technical_skills(text),
-            "key_skills": calculate_key_skills(text, experiences),
-            "education": extract_education(text),
-            "certifications": extract_certifications(text),
+            "key_skills": key_skills,
+            "education": education,
+            "certifications": certifications,
             "experience": [
                 {
-                    "Employer": e.employer,
-                    "title": e.title,
-                    "location": e.location,
+                    "Employer": clean_output_text(e.employer),
+                    "title": clean_output_text(e.title),
+                    "location": clean_output_text(e.location),
+                    "client": clean_output_text(e.client) if e.client else "",
                     "start_date": e.start_date,
                     "end_date": e.end_date,
                     "duration_months": e.duration_months,
-                    "responsibilities": e.responsibilities,
+                    "responsibilities": [clean_output_text(r) for r in e.responsibilities],
                     "tools": e.tools
                 }
                 for e in experiences
@@ -902,9 +1035,9 @@ async def parse_resume_full(params: ParseResumeInput) -> str:
         }
     }
     
-    # AI validation for complex cases
+    # AI validation if enabled and needed
     if params.use_ai_validation and ANTHROPIC_API_KEY:
-        result = await validate_and_enhance_with_ai(text, result)
+        result = await validate_with_ai(text, result)
     
     return json.dumps(result, indent=2, ensure_ascii=False)
 
