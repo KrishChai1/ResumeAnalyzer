@@ -81,13 +81,24 @@ async def parse_file(
     if ext not in ['pdf', 'docx', 'doc', 'txt']:
         raise HTTPException(400, f"Unsupported: {ext}")
     
+    import tempfile
+    import os as os_module
+    
+    temp_path = None
+    
     try:
         content = await file.read()
         
-        if ext == 'pdf':
-            text = extract_pdf(content)
-        elif ext in ['docx', 'doc']:
+        # For DOCX files, save temporarily to enable textbox/table extraction
+        if ext in ['docx', 'doc']:
+            # Create temp file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{ext}') as tmp:
+                tmp.write(content)
+                temp_path = tmp.name
+            
             text = extract_docx(content)
+        elif ext == 'pdf':
+            text = extract_pdf(content)
         else:
             text = content.decode('utf-8', errors='ignore')
         
@@ -97,6 +108,7 @@ async def parse_file(
         result = await parse_resume_full(ParseResumeInput(
             resume_text=text,
             filename=file.filename,
+            file_path=temp_path,  # Pass file path for textbox/table extraction
             use_ai_validation=use_ai_validation
         ))
         
@@ -107,6 +119,13 @@ async def parse_file(
         raise
     except Exception as e:
         raise HTTPException(500, f"Error: {str(e)}")
+    finally:
+        # Clean up temp file
+        if temp_path and os_module.path.exists(temp_path):
+            try:
+                os_module.remove(temp_path)
+            except:
+                pass
 
 
 @app.post("/parse", tags=["Parsing"])
@@ -145,10 +164,31 @@ def extract_pdf(content: bytes) -> str:
 
 
 def extract_docx(content: bytes) -> str:
+    """Extract text from DOCX including paragraphs and tables."""
     from docx import Document
     import io
     doc = Document(io.BytesIO(content))
-    return '\n'.join([p.text for p in doc.paragraphs if p.text.strip()])
+    
+    all_text = []
+    
+    # Extract paragraphs
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            all_text.append(text)
+    
+    # Extract tables (important for table-based resumes)
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = []
+            for cell in row.cells:
+                cell_text = cell.text.strip()
+                if cell_text:
+                    row_text.append(cell_text)
+            if row_text:
+                all_text.append(' | '.join(row_text))
+    
+    return '\n'.join(all_text)
 
 
 if __name__ == "__main__":
