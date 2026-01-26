@@ -539,11 +539,16 @@ def extract_from_docx_tables(file_path: str) -> Dict:
 
 
 def clean_output_text(text: str) -> str:
-    """Clean text for final output - remove artifacts."""
+    """Clean text for final output - remove artifacts and control characters."""
     if not text:
         return ""
-    # Remove literal \n
+    # Remove literal \n and actual newlines
     text = text.replace('\\n', ' ')
+    text = text.replace('\n', ' ')
+    text = text.replace('\r', ' ')
+    text = text.replace('\t', ' ')
+    # Remove any remaining control characters (ASCII 0-31 except space)
+    text = ''.join(c if ord(c) >= 32 or c == ' ' else ' ' for c in text)
     # Fix encoding artifacts
     text = text.replace('â€"', '-').replace('â€™', "'").replace('â€œ', '"').replace('â€', '"')
     # Remove location patterns embedded in titles
@@ -2605,8 +2610,15 @@ async def parse_resume_full(params: ParseResumeInput) -> str:
             "total_experience_years": round(sum(e.duration_months for e in experiences) / 12, 1) if experiences else 0,
             "technical_skills": extract_technical_skills(text),
             "key_skills": key_skills,
-            "education": education,
-            "certifications": certifications,
+            "education": [
+                {
+                    "degree": clean_output_text(e.get('degree', '')) if e.get('degree') else None,
+                    "institution": clean_output_text(e.get('institution', '')) if e.get('institution') else None,
+                    "year": e.get('year')
+                }
+                for e in education
+            ],
+            "certifications": [clean_output_text(c) for c in certifications],
             "experience": [
                 {
                     "Employer": clean_output_text(e.employer) if e.employer else None,
