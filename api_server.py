@@ -1,36 +1,45 @@
 """
-Resume Parser API Server
-========================
-FastAPI server for resume parsing with Swagger UI.
+Resume Parser API Server v3.0
+==============================
+FastAPI server with Swagger UI using Smart Agentic Parser.
 """
 
 import os
+import io
+import tempfile
 import asyncio
 from typing import Optional
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from resume_parser_mcp import (
-    parse_resume_full, ParseResumeInput, ResponseFormat,
-    extract_technical_skills, normalize_text, ANTHROPIC_API_KEY
-)
+from smart_parser import SmartResumeParser, normalize_text
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 app = FastAPI(
-    title="Resume Parser API",
+    title="Smart Resume Parser API",
     description="""
-## Production-Grade Resume Parser with AI Validation
+## Enterprise-Grade Agentic Resume Parser v3.0
 
-### Features:
-- Multi-format: PDF, DOCX, TXT
-- Intelligent extraction: Name, contact, education, experience, skills
-- Skill categorization with experience months
-- Optional Claude AI validation
+### Architecture:
+- **Format Detector**: Auto-detects resume structure
+- **Multi-Strategy Extraction**: Specialized extractors for each format
+- **Validation Agent**: Quality scoring (0-100)
+- **AI Fallback**: Claude API for complex cases
+
+### Supported Formats:
+- PIPE: `Title | Company | Date`
+- SLASH_DATE: `MM/YYYY - MM/YYYY`
+- ROLE_BASED: `Company Date` then `ROLE: Title`
+- WORKED_AS: `Worked as X in Y from A to B`
+- TABLE: Structured tables
+- TEXTBOX: Multi-column layouts
 
 ### Configuration:
-Set `ANTHROPIC_API_KEY` environment variable for AI enhancement.
+Set `ANTHROPIC_API_KEY` for AI enhancement.
     """,
-    version="2.0.0",
+    version="3.0.0",
     docs_url="/docs"
 )
 
@@ -46,20 +55,16 @@ app.add_middleware(
 class ParseTextRequest(BaseModel):
     text: str = Field(..., min_length=50)
     use_ai_validation: bool = Field(default=True)
-    filename: Optional[str] = Field(default=None)
-
-
-class ExtractSkillsRequest(BaseModel):
-    text: str = Field(..., min_length=10)
 
 
 @app.get("/", tags=["Info"])
 async def root():
     return {
-        "name": "Resume Parser API",
-        "version": "2.0.0",
+        "name": "Smart Resume Parser API",
+        "version": "3.0.0",
         "docs": "/docs",
-        "ai_validation": "enabled" if ANTHROPIC_API_KEY else "disabled"
+        "ai_available": bool(ANTHROPIC_API_KEY),
+        "supported_formats": ["pdf", "docx", "doc", "txt"]
     }
 
 
@@ -73,102 +78,81 @@ async def parse_file(
     file: UploadFile = File(...),
     use_ai_validation: bool = Form(default=True)
 ):
-    """Parse resume from PDF/Word file."""
+    """Parse resume from PDF/DOCX file."""
     if not file.filename:
         raise HTTPException(400, "No file provided")
     
     ext = file.filename.lower().split('.')[-1]
     if ext not in ['pdf', 'docx', 'doc', 'txt']:
-        raise HTTPException(400, f"Unsupported: {ext}")
-    
-    import tempfile
-    import os as os_module
-    
-    temp_path = None
+        raise HTTPException(400, f"Unsupported format: {ext}")
     
     try:
         content = await file.read()
         
-        # For DOCX files, save temporarily to enable textbox/table extraction
-        if ext in ['docx', 'doc']:
-            # Create temp file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{ext}') as tmp:
-                tmp.write(content)
-                temp_path = tmp.name
-            
-            text = extract_docx(content)
-        elif ext == 'pdf':
+        # Extract text based on file type
+        if ext == 'pdf':
             text = extract_pdf(content)
+        elif ext in ['docx', 'doc']:
+            text = extract_docx(content)
         else:
             text = content.decode('utf-8', errors='ignore')
         
         if len(text.strip()) < 50:
-            raise HTTPException(400, "Insufficient text extracted")
+            raise HTTPException(400, "Insufficient text extracted from file")
         
-        result = await parse_resume_full(ParseResumeInput(
-            resume_text=text,
-            filename=file.filename,
-            file_path=temp_path,  # Pass file path for textbox/table extraction
-            use_ai_validation=use_ai_validation
-        ))
+        # Parse using smart parser
+        result = await SmartResumeParser.parse(text, use_ai=use_ai_validation)
         
-        import json
-        return json.loads(result)
+        return result
     
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Error: {str(e)}")
-    finally:
-        # Clean up temp file
-        if temp_path and os_module.path.exists(temp_path):
-            try:
-                os_module.remove(temp_path)
-            except:
-                pass
+        raise HTTPException(500, f"Error parsing resume: {str(e)}")
 
 
 @app.post("/parse", tags=["Parsing"])
 async def parse_text(request: ParseTextRequest):
-    """Parse resume from text."""
+    """Parse resume from plain text."""
     try:
-        result = await parse_resume_full(ParseResumeInput(
-            resume_text=request.text,
-            filename=request.filename,
-            use_ai_validation=request.use_ai_validation
-        ))
-        import json
-        return json.loads(result)
+        result = await SmartResumeParser.parse(
+            request.text, 
+            use_ai=request.use_ai_validation
+        )
+        return result
     except Exception as e:
         raise HTTPException(500, f"Error: {str(e)}")
 
 
-@app.post("/extract/skills", tags=["Utilities"])
-async def extract_skills(request: ExtractSkillsRequest):
-    """Extract technical skills from text."""
-    skills = extract_technical_skills(request.text)
-    return {"skills": skills, "count": len(skills)}
-
-
 def extract_pdf(content: bytes) -> str:
+    """Extract text from PDF with fallback."""
+    text = ""
+    
+    # Try pdfplumber first
     try:
         import pdfplumber
-        import io
         with pdfplumber.open(io.BytesIO(content)) as pdf:
-            return '\n'.join([p.extract_text() or '' for p in pdf.pages])
-    except ImportError:
-        from PyPDF2 import PdfReader
-        import io
-        reader = PdfReader(io.BytesIO(content))
-        return '\n'.join([p.extract_text() or '' for p in reader.pages])
+            text = '\n'.join([page.extract_text() or '' for page in pdf.pages])
+    except Exception:
+        pass
+    
+    # Fallback to PyPDF2 if pdfplumber failed or returned minimal text
+    if len(text.strip()) < 100:
+        try:
+            from PyPDF2 import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            text = '\n'.join([page.extract_text() or '' for page in reader.pages])
+        except Exception:
+            pass
+    
+    return text
 
 
 def extract_docx(content: bytes) -> str:
-    """Extract text from DOCX including paragraphs and tables."""
+    """Extract text from DOCX including tables and text boxes."""
     from docx import Document
-    import io
-    doc = Document(io.BytesIO(content))
     
+    doc = Document(io.BytesIO(content))
     all_text = []
     
     # Extract paragraphs
@@ -177,16 +161,30 @@ def extract_docx(content: bytes) -> str:
         if text:
             all_text.append(text)
     
-    # Extract tables (important for table-based resumes)
+    # Extract tables
     for table in doc.tables:
         for row in table.rows:
-            row_text = []
-            for cell in row.cells:
-                cell_text = cell.text.strip()
-                if cell_text:
-                    row_text.append(cell_text)
+            row_text = ' | '.join([cell.text.strip() for cell in row.cells if cell.text.strip()])
             if row_text:
-                all_text.append(' | '.join(row_text))
+                all_text.append(row_text)
+    
+    # Extract text boxes (for multi-column layouts)
+    try:
+        import re as regex
+        xml_str = doc.element.xml
+        pattern = r'<w:txbxContent[^>]*>(.*?)</w:txbxContent>'
+        matches = regex.findall(pattern, xml_str, regex.DOTALL)
+        
+        for match in matches:
+            text_pattern = r'<w:t[^>]*>([^<]+)</w:t>'
+            texts = regex.findall(text_pattern, match)
+            if texts:
+                combined = ' '.join(texts)
+                combined = ' '.join(combined.split())
+                if combined and len(combined) > 5:
+                    all_text.append(combined)
+    except Exception:
+        pass
     
     return '\n'.join(all_text)
 
