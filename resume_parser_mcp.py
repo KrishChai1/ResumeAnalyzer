@@ -632,7 +632,17 @@ def extract_name(text: str) -> Tuple[str, str, str]:
         'technical', 'core competencies', 'profile', 'experience summary',
         'achievements', 'certifications', 'professional summary', 'experience -',
         'data warehouse', 'sql server', 'reporting tools', 'results-driven',
-        'experienced', 'skilled', 'dedicated', 'professional with', 'having'
+        'experienced', 'skilled', 'dedicated', 'professional with', 'having',
+        'languages', 'cloud', 'web applications', 'version', 'configuration',
+        'operating', 'databases', 'tools', 'contact', 'phone', 'email', 'ph:',
+        'work experience', 'work location', 'key skills', 'domain:'
+    ]
+    
+    # Full patterns to skip (exact match after lowercase)
+    skip_exact_patterns = [
+        'technical skills', 'professional skills', 'key skills', 'core skills',
+        'work experience', 'professional experience', 'contact information',
+        'contact details', 'personal information', 'personal details'
     ]
     
     for line in lines:
@@ -646,11 +656,17 @@ def extract_name(text: str) -> Tuple[str, str, str]:
         # Skip lines that START with skip patterns
         if any(name_part.lower().startswith(skip) for skip in skip_start_patterns):
             continue
+        # Skip exact matches
+        if name_part.lower() in skip_exact_patterns:
+            continue
         # Skip lines ending with colon (likely headers)
         if name_part.endswith(':'):
             continue
         # Skip if entire line is an email or phone
         if re.match(r'^[\w.+-]+@[\w.-]+\.\w+$', name_part) or re.match(r'^[\d\s\-+()]+$', name_part):
+            continue
+        # Skip lines that look like skill categories
+        if re.match(r'^[A-Za-z\s]+\s*:\s*', name_part):
             continue
         
         # Clean name further - remove email/phone if inline
@@ -666,15 +682,31 @@ def extract_name(text: str) -> Tuple[str, str, str]:
         # Check if it looks like a name (2-4 parts, all start with uppercase)
         if 2 <= len(parts) <= 4:
             if all(p[0].isupper() for p in parts if p):
-                # Additional check: not tech terms
+                # Additional check: not tech terms or common headers
                 tech_terms = ['SQL', 'ETL', 'GCP', 'AWS', 'API', 'XML', 'JSON', 'HTML', 'CSS', 'SSIS', 'SSAS']
-                if not any(p in tech_terms for p in parts):
+                header_words = ['Technical', 'Skills', 'Professional', 'Experience', 'Summary', 'Contact', 'Information', 'Details', 'Work', 'Education', 'Objective']
+                if not any(p in tech_terms for p in parts) and not all(p in header_words for p in parts):
                     if len(parts) == 2:
                         return parts[0], "", parts[1]
                     elif len(parts) == 3:
                         return parts[0], parts[1], parts[2]
                     else:
                         return parts[0], ' '.join(parts[1:-1]), parts[-1]
+    
+    # Fallback: Try to extract name from email address
+    email_match = re.search(r'\b([a-zA-Z0-9._%+-]+)@', text)
+    if email_match:
+        email_local = email_match.group(1)
+        # Try to parse email local part as name (e.g., "john.doe" -> "John Doe")
+        # Skip if it looks like a generic email
+        if not any(g in email_local.lower() for g in ['info', 'contact', 'admin', 'support', 'hr', 'sales']):
+            # Split on dots, underscores, numbers
+            name_parts = re.split(r'[._\d]+', email_local)
+            name_parts = [p.capitalize() for p in name_parts if p and len(p) > 1]
+            if len(name_parts) >= 2:
+                return name_parts[0], "", name_parts[-1]
+            elif len(name_parts) == 1:
+                return name_parts[0], "", ""
     
     return "", "", ""
 
@@ -709,15 +741,27 @@ def extract_title(text: str, experiences: List[ExperienceEntry]) -> str:
             if any(kw in title.lower() for kw in ['manager', 'engineer', 'developer', 'analyst', 'consultant', 'lead', 'tester']):
                 return clean_output_text(title)
     
+    # Try to find "ROLE:" pattern in text
+    role_match = re.search(r'ROLE[:\s]+([A-Za-z\s]+(?:Analyst|Engineer|Developer|Manager|Consultant|Lead|Specialist))', text, re.IGNORECASE)
+    if role_match:
+        return clean_output_text(role_match.group(1))
+    
     # Fallback to most recent job title (cleaned)
     if experiences:
-        title = experiences[0].title
-        if title:
-            # Remove suffix like "– Cognizant Infra Services"
-            title = re.sub(r'\s*[-–]\s*[A-Z][\w\s]+(?:Services|Solutions|Group|Team)?\s*$', '', title)
-            # Remove location
-            title = re.sub(r'\s+(Philadelphia|Chicago|Dallas|Plano|Bangalore|Bengaluru|Hyderabad|North Chicago|India|USA|Karnataka)[,\s]*(?:PA|TX|IL|NY|CA|USA|India)?$', '', title, flags=re.IGNORECASE)
-            return clean_output_text(title)
+        for exp in experiences:
+            title = exp.title
+            if title:
+                # Skip if title is "Work Location" or similar
+                if re.match(r'^Work\s+Location', title, re.IGNORECASE):
+                    continue
+                if re.match(r'^ROLE:', title, re.IGNORECASE):
+                    continue
+                # Remove suffix like "– Cognizant Infra Services"
+                title = re.sub(r'\s*[-–]\s*[A-Z][\w\s]+(?:Services|Solutions|Group|Team)?\s*$', '', title)
+                # Remove location
+                title = re.sub(r'\s+(Philadelphia|Chicago|Dallas|Plano|Bangalore|Bengaluru|Hyderabad|North Chicago|India|USA|Karnataka)[,\s]*(?:PA|TX|IL|NY|CA|USA|India)?$', '', title, flags=re.IGNORECASE)
+                if title:
+                    return clean_output_text(title)
     
     return ""
 
@@ -1039,6 +1083,14 @@ def parse_date(text: str) -> Tuple[Optional[int], Optional[int], bool]:
         year = int(match.group(2))
         return year, month, False
     
+    # Apostrophe format: Feb'20, May'21, Aug'15
+    match = re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)['\u2019](\d{2})", text, re.IGNORECASE)
+    if match:
+        month = MONTH_MAP.get(match.group(1).lower())
+        year_short = int(match.group(2))
+        year = 2000 + year_short if year_short < 50 else 1900 + year_short
+        return year, month, False
+    
     # Compact format: Jan2021, Jul24
     match = re.search(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)(\d{2,4})', text, re.IGNORECASE)
     if match:
@@ -1223,6 +1275,219 @@ def extract_experiences(text: str) -> List[ExperienceEntry]:
     """Extract work experiences - handles multiple formats."""
     experiences = []
     
+    # Strategy 0: "Title | Company, Location | Date Range" format (Steven style)
+    # Example: "Sr.Cloud/DeVOPS Engineer | RElix, Tx | November 2022 – Present"
+    pipe_date_pattern = r'^([^|]+)\s*\|\s*([^|]+)\s*\|\s*((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})\s*[-–]\s*((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|Present|Current)$'
+    for line in text.split('\n'):
+        match = re.match(pipe_date_pattern, line.strip(), re.IGNORECASE)
+        if match:
+            title = match.group(1).strip()
+            company_loc = match.group(2).strip()
+            start_str = match.group(3)
+            end_str = match.group(4)
+            
+            # Parse company and location
+            employer = company_loc
+            location = ""
+            if ',' in company_loc:
+                parts = company_loc.rsplit(',', 1)
+                employer = parts[0].strip()
+                location = parts[1].strip() if len(parts) > 1 else ""
+            
+            start_year, start_month, _ = parse_date(start_str)
+            end_year, end_month, is_present = parse_date(end_str)
+            
+            if start_year and end_year:
+                duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
+                start_date = f"{start_year}-{(start_month or 1):02d}"
+                end_date = f"{end_year}-{(end_month or 12):02d}" if not is_present else f"{datetime.now().year}-{datetime.now().month:02d}"
+                
+                is_dup = any(e.title == title and e.start_date == start_date for e in experiences)
+                if not is_dup:
+                    experiences.append(ExperienceEntry(
+                        employer=employer,
+                        title=title,
+                        location=location,
+                        start_date=start_date,
+                        end_date=end_date,
+                        duration_months=duration
+                    ))
+    
+    # Strategy 0b: "Title Company - Location" then "Date Range" on next line (Javvaji style)
+    # Example: "Senior Java Developer LOWE'S - USA" then "05/2023 - Present"
+    # Also: "Senior(Lead) Java Consultant Renault-Nissan - France & North America" then "02/2015 - 04/2023"
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        # Check if next line is a date range
+        if i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            date_only_match = re.match(r'^(\d{2}/\d{4})\s*[-–]\s*(\d{2}/\d{4}|Present|Current)$', next_line, re.IGNORECASE)
+            if date_only_match:
+                # This line should be "Title Company - Location"
+                header = line.strip()
+                # Skip if it's a section header
+                if header.upper() in ['EXPERIENCE', 'WORK EXPERIENCE', 'PROFESSIONAL EXPERIENCE', 'EMPLOYMENT']:
+                    continue
+                
+                # Parse: "Senior Java Developer LOWE'S - USA" or "Senior(Lead) Java Consultant Renault-Nissan - France & North America"
+                loc_match = re.search(r'\s*[-–]\s*(USA|India|France|UK|Canada|Germany|North America|Europe|France & North America)\s*$', header, re.IGNORECASE)
+                location = ""
+                if loc_match:
+                    location = loc_match.group(1).strip()
+                    header = header[:loc_match.start()].strip()
+                
+                # Try to split title and company
+                employer = ""
+                title = header
+                
+                # Pattern 1: Look for uppercase company at end (LOWE'S, IBM, etc.)
+                title_company_match = re.match(r'^(.+?)\s+([A-Z][A-Z\s&\']+(?:\'S)?)\s*$', header)
+                if title_company_match:
+                    title = title_company_match.group(1).strip()
+                    employer = title_company_match.group(2).strip()
+                else:
+                    # Pattern 2: Look for company name like "Renault-Nissan" at end
+                    # Title words: Developer, Engineer, Consultant, Manager, Analyst, Lead, etc.
+                    title_words = ['Developer', 'Engineer', 'Consultant', 'Manager', 'Analyst', 'Lead', 'Architect', 'Administrator', 'Specialist', 'Director']
+                    for tw in title_words:
+                        idx = header.rfind(tw)
+                        if idx > 0:
+                            potential_title = header[:idx + len(tw)].strip()
+                            potential_employer = header[idx + len(tw):].strip()
+                            # Clean up employer
+                            potential_employer = re.sub(r'^[\s\-–]+', '', potential_employer).strip()
+                            if potential_employer:
+                                title = potential_title
+                                employer = potential_employer
+                                break
+                
+                # Parse dates
+                start_str = date_only_match.group(1)
+                end_str = date_only_match.group(2)
+                
+                # Parse MM/YYYY format
+                start_match = re.match(r'(\d{2})/(\d{4})', start_str)
+                if start_match:
+                    start_month = int(start_match.group(1))
+                    start_year = int(start_match.group(2))
+                else:
+                    continue
+                
+                if 'present' in end_str.lower() or 'current' in end_str.lower():
+                    end_year = datetime.now().year
+                    end_month = datetime.now().month
+                    is_present = True
+                else:
+                    end_match = re.match(r'(\d{2})/(\d{4})', end_str)
+                    if end_match:
+                        end_month = int(end_match.group(1))
+                        end_year = int(end_match.group(2))
+                        is_present = False
+                    else:
+                        continue
+                
+                duration = calculate_duration(start_year, start_month, end_year, end_month)
+                start_date = f"{start_year}-{start_month:02d}"
+                end_date = f"{end_year}-{end_month:02d}"
+                
+                # Get responsibilities (lines starting with bullets after the date)
+                responsibilities = []
+                j = i + 2
+                while j < len(lines) and j < i + 30:
+                    resp_line = lines[j].strip()
+                    # Stop at next job header or section
+                    if re.match(r'^\d{2}/\d{4}\s*[-–]', resp_line):
+                        break
+                    if re.match(r'^[A-Z][a-z]+\s+[A-Z][a-z]+\s+[A-Z]', resp_line):  # New title
+                        break
+                    if resp_line.startswith(('■', '•', '-', '*')):
+                        resp = re.sub(r'^[■•\-\*]\s*', '', resp_line)
+                        if len(resp) > 20:
+                            responsibilities.append(clean_output_text(resp))
+                    j += 1
+                
+                is_dup = any(e.employer == employer and e.start_date == start_date for e in experiences)
+                if not is_dup and (title or employer):
+                    experiences.append(ExperienceEntry(
+                        employer=employer,
+                        title=title,
+                        location=location,
+                        start_date=start_date,
+                        end_date=end_date,
+                        duration_months=duration,
+                        responsibilities=responsibilities[:12]
+                    ))
+    
+    # Strategy 0c: "Company Date" then "Work Location" then "ROLE: Title" (Sarwar style)
+    # Example: "BNP Paribas May 2021 – Aug 2024" then "Work Location – Bengaluru" then "ROLE: Business Analyst"
+    date_range_line_pattern = r'^([A-Z][A-Za-z\s&]+)\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4})\s*[-–]\s*((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}|Present|Current)$'
+    for i, line in enumerate(lines):
+        match = re.match(date_range_line_pattern, line.strip(), re.IGNORECASE)
+        if match:
+            employer = match.group(1).strip()
+            start_str = match.group(2)
+            end_str = match.group(3)
+            
+            # Skip if employer looks like a section header
+            if employer.upper() in ['WORK EXPERIENCE', 'PROFESSIONAL EXPERIENCE', 'EXPERIENCE', 'EMPLOYMENT']:
+                continue
+            
+            start_year, start_month, _ = parse_date(start_str)
+            end_year, end_month, is_present = parse_date(end_str)
+            
+            if not start_year or not end_year:
+                continue
+            
+            # Look for "Work Location" and "ROLE:" in next few lines
+            title = ""
+            location = ""
+            responsibilities = []
+            
+            for j in range(i + 1, min(i + 5, len(lines))):
+                check_line = lines[j].strip()
+                
+                # Check for Work Location
+                loc_match = re.match(r'^Work\s+Location\s*[-–]\s*(.+)$', check_line, re.IGNORECASE)
+                if loc_match:
+                    location = loc_match.group(1).strip()
+                    continue
+                
+                # Check for ROLE: or DESIGNATION:
+                role_match = re.match(r'^(?:ROLE|DESIGNATION)[:\s]+(.+)$', check_line, re.IGNORECASE)
+                if role_match:
+                    title = role_match.group(1).strip()
+                    break
+            
+            # Get responsibilities (bullet points after ROLE line)
+            if title:
+                for j in range(i + 1, min(i + 50, len(lines))):
+                    resp_line = lines[j].strip()
+                    # Stop at next company header
+                    if re.match(date_range_line_pattern, resp_line, re.IGNORECASE):
+                        break
+                    if resp_line.startswith('---'):
+                        break
+                    if resp_line.startswith(('•', '-', '*')):
+                        resp = re.sub(r'^[•\-\*]\s*', '', resp_line)
+                        if len(resp) > 20:
+                            responsibilities.append(clean_output_text(resp))
+            
+            duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
+            start_date = f"{start_year}-{(start_month or 1):02d}"
+            end_date = f"{end_year}-{(end_month or 12):02d}" if not is_present else f"{datetime.now().year}-{datetime.now().month:02d}"
+            
+            is_dup = any(e.employer == employer and e.start_date == start_date for e in experiences)
+            if not is_dup and employer:
+                experiences.append(ExperienceEntry(
+                    employer=employer,
+                    title=title if title else "Professional",
+                    location=location,
+                    start_date=start_date,
+                    end_date=end_date,
+                    duration_months=duration,
+                    responsibilities=responsibilities[:12]
+                ))
+    
     # Strategy 1: "Worked as X in Y from A to B" format
     worked_pattern = r'[Ww]ork(?:ed|ing)\s+(?:as\s+)?(?:a\s+)?(.+?)\s+in\s+(.+?)\s+from\s+(\w+\s+\d{4})\s+to\s+(\w+\s+\d{4}|Present|Current)'
     for match in re.finditer(worked_pattern, text, re.IGNORECASE):
@@ -1279,7 +1544,8 @@ def extract_experiences(text: str) -> List[ExperienceEntry]:
     
     # Strategy 3: "Client: Company – Location Date" then "Title" (Naveen style)
     # Example: "Client: Ascent Global Logistics – Atlanta, GA.    Jul24 to Present"
-    client_pattern = r'^Client:\s*(.+?)[-–]\s*([A-Za-z\s,]+\.?)\s+(\w{3}\d{2})\s+to\s+(\w{3}\d{2}|Present|P)$'
+    # Also handles: "Client: Hiscox Inc - Atlanta, Georgia Feb'20 to May'21"
+    client_pattern = r"^Client:\s*(.+?)[-–]\s*([A-Za-z\s,]+\.?)\s+(\w{3}['\u2019]?\d{2})\s+to\s+(\w{3}['\u2019]?\d{2}|Present|P)$"
     lines = text.split('\n')
     for i, line in enumerate(lines):
         match = re.match(client_pattern, line.strip(), re.IGNORECASE)
@@ -1289,9 +1555,9 @@ def extract_experiences(text: str) -> List[ExperienceEntry]:
             start_str = match.group(3)
             end_str = match.group(4)
             
-            # Convert short date format (Jul24 -> July 2024)
-            start_year, start_month, _ = parse_short_date(start_str)
-            end_year, end_month, is_present = parse_short_date(end_str)
+            # Convert short date format (Jul24 -> July 2024, Feb'20 -> Feb 2020)
+            start_year, start_month, _ = parse_date(start_str)
+            end_year, end_month, is_present = parse_date(end_str)
             
             if start_year and end_year:
                 # Next line should be title
@@ -1712,10 +1978,25 @@ def extract_education(text: str) -> List[Dict[str, str]]:
     education = []
     seen_degrees = set()  # Track unique degrees to avoid duplicates
     
+    # Job titles to filter out - these should NOT be in education
+    job_title_patterns = [
+        r'specialist', r'manager', r'engineer', r'developer', r'analyst', r'consultant',
+        r'director', r'lead', r'architect', r'administrator', r'coordinator', r'executive',
+        r'officer', r'supervisor', r'head\s+of', r'vp\b', r'vice\s+president', r'delivery',
+        r'global\s+business', r'professional\s+services', r'directed', r'led\s+', r'managed'
+    ]
+    
+    def is_job_title(text: str) -> bool:
+        """Check if text looks like a job title instead of education."""
+        if not text:
+            return False
+        text_lower = text.lower()
+        return any(re.search(p, text_lower) for p in job_title_patterns)
+    
     # Find education section (multiple possible headers)
     # Note: Be specific to avoid matching "TECHNICAL QUALIFICATION"
     edu_match = re.search(
-        r'(?:EDUCATION(?:AL)?\s*(?:QUALIFICATION|BACKGROUND|DETAILS)?|ACADEMIC\s*(?:QUALIFICATION|BACKGROUND)?)[:\s]*\n?(.+?)(?:\nROLES|\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nPERSONAL|\nCERTIFI|\nCORE|\nAS\s+A\s+SCRUM|\nSKILLS|\nACHIEVEMENT|\n_+|\Z)',
+        r'(?:EDUCATION(?:AL)?\s*(?:QUALIFICATION|BACKGROUND|DETAILS)?|ACADEMIC\s*(?:QUALIFICATION|BACKGROUND)?)[:\s]*\n?(.+?)(?:\nROLES|\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nPERSONAL|\nCERTIFI|\nCORE|\nAS\s+A\s+SCRUM|\nSKILLS|\nACHIEVEMENT|\nTOOLS|\n_+|\Z)',
         text, re.IGNORECASE | re.DOTALL
     )
     
@@ -1724,6 +2005,8 @@ def extract_education(text: str) -> List[Dict[str, str]]:
     inline_patterns = [
         # "Masters in Computer Science from Sri Venkateswara University, Tirupati"
         r'(Masters?|Bachelor\'?s?|MBA|MCA|BCA|B\.?Tech|M\.?Tech|Ph\.?D|Doctorate)\s+(?:in|of)\s+([A-Za-z\s]{3,30}?)\s+from\s+([A-Za-z\s]{3,40}?(?:University|College|Institute)[A-Za-z\s,]{0,30})',
+        # "Masters of Business Administration (Finance) - Osmania University"
+        r'(Masters?|Bachelor\'?s?)\s+of\s+([A-Za-z\s()]+?)\s*[-–]\s*([A-Za-z\s]+(?:University|College|Institute))',
     ]
     
     for pattern in inline_patterns:
@@ -1733,7 +2016,7 @@ def extract_education(text: str) -> List[Dict[str, str]]:
             institution = match.group(3).strip()
             
             # Build unique key
-            degree_str = f"{degree_type} in {field}".strip()
+            degree_str = f"{degree_type} of {field}".strip()
             degree_key = degree_str.lower()
             
             # Skip if already seen
@@ -1746,6 +2029,37 @@ def extract_education(text: str) -> List[Dict[str, str]]:
                 'institution': institution,
                 'year': None
             })
+    
+    # Fallback: Look for "University...Date" pattern followed by degree line (Khaliq format)
+    # This handles resumes without an EDUCATION header
+    if not edu_match and not education:
+        lines = text.split('\n')
+        for i, line in enumerate(lines):
+            # Pattern: "University of X Date - Date" or "X University Date - Date"
+            uni_match = re.search(r'((?:\w+\s+)?University(?:\s+of\s+\w+)?|(?:\w+\s+)?College|(?:\w+\s+)?Institute)[,\s]+(?:\w+[,\s]+)*(\w+\s+\d{4})\s*[-–]\s*(\w+\s+\d{4})', line, re.IGNORECASE)
+            if uni_match:
+                institution = line[:uni_match.end()].strip()
+                # Clean institution - remove date part
+                institution = re.sub(r'\s+\w+\s+\d{4}\s*[-–]\s*\w+\s+\d{4}.*$', '', institution).strip()
+                year = uni_match.group(3).split()[-1]  # End year
+                
+                # Next line should be degree
+                degree = None
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    degree_keywords = ['mba', 'bachelor', 'master', 'b.tech', 'm.tech', 'mca', 'bca', 'engineering', 'science', 'arts', 'commerce', 'computer']
+                    if any(kw in next_line.lower() for kw in degree_keywords):
+                        degree = next_line
+                
+                if institution and degree:
+                    degree_key = degree.lower()
+                    if degree_key not in seen_degrees:
+                        seen_degrees.add(degree_key)
+                        education.append({
+                            'degree': degree,
+                            'institution': institution,
+                            'year': year
+                        })
     
     if not edu_match and not education:
         return education
@@ -1765,16 +2079,33 @@ def extract_education(text: str) -> List[Dict[str, str]]:
             
             entry = {}
             
-            # Format 1: "Degree | Institution | Month Year" (Sudheer/Pipe format)
-            # Example: "Master of Science, Information Systems | Texas A&M International University | Dec 2015"
+            # Format 1a: "Degree | Date | Institution" (Steven format)
+            # Example: "Masters in computer science |December 2015 |Northwestern Polytechnic University"
             if line.count('|') >= 2:
                 parts = [p.strip() for p in line.split('|')]
-                entry['degree'] = parts[0]
-                entry['institution'] = parts[1]
-                # Extract year from last part
-                year_match = re.search(r'(\d{4})', parts[-1])
-                if year_match:
-                    entry['year'] = year_match.group(1)
+                
+                # Check if middle part looks like a date (month/year)
+                middle_is_date = bool(re.search(r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December)\s*\d{4}|\d{4}', parts[1], re.IGNORECASE))
+                
+                if middle_is_date and len(parts) >= 3:
+                    # Format: Degree | Date | Institution
+                    entry['degree'] = parts[0]
+                    entry['institution'] = parts[2] if len(parts) > 2 else None
+                    year_match = re.search(r'(\d{4})', parts[1])
+                    if year_match:
+                        entry['year'] = year_match.group(1)
+                else:
+                    # Format: Degree | Institution | Date
+                    entry['degree'] = parts[0]
+                    entry['institution'] = parts[1]
+                    year_match = re.search(r'(\d{4})', parts[-1])
+                    if year_match:
+                        entry['year'] = year_match.group(1)
+                
+                # Skip if degree looks like a job title
+                if is_job_title(entry.get('degree', '')) or is_job_title(entry.get('institution', '')):
+                    i += 1
+                    continue
                 
                 # Check for duplicate
                 degree_key = entry['degree'].lower()
@@ -1791,6 +2122,11 @@ def extract_education(text: str) -> List[Dict[str, str]]:
                 entry['degree'] = dash_pipe_match.group(1).strip()
                 entry['institution'] = dash_pipe_match.group(2).strip()
                 entry['year'] = dash_pipe_match.group(4)  # End year
+                
+                # Skip if degree looks like a job title
+                if is_job_title(entry['degree']) or is_job_title(entry.get('institution', '')):
+                    i += 1
+                    continue
                 
                 degree_key = entry['degree'].lower()
                 if degree_key not in seen_degrees:
@@ -1818,6 +2154,11 @@ def extract_education(text: str) -> List[Dict[str, str]]:
                             if any(kw in next_line.lower() for kw in degree_keywords) or ',' in next_line:
                                 entry['degree'] = next_line
                                 i += 1
+                    
+                    # Skip if institution looks like a job title
+                    if is_job_title(entry.get('institution', '')) or is_job_title(entry.get('degree', '')):
+                        i += 1
+                        continue
                     
                     education.append(entry)
                     i += 1
@@ -1888,10 +2229,11 @@ def extract_certifications(text: str) -> List[str]:
     """Extract certifications."""
     certifications = []
     
-    # Multiple section patterns
+    # Multiple section patterns - handle various headers
     cert_patterns = [
-        r'CERTIFICATIONS?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nEDUCATION|\nSKILLS|\Z)',
-        r'CERTIFICATES?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\Z)',
+        r'CERTIFICATIONS?\s*[/&]?\s*(?:TRAININGS?)?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nEDUCATION|\nSKILLS|\nTOOLS|\nWORK|\Z)',
+        r'CERTIFICATES?\s*[/&]?\s*(?:TRAININGS?)?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nTOOLS|\Z)',
+        r'TRAININGS?\s*[/&]?\s*(?:CERTIFICATIONS?)?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nSKILLS|\nTOOLS|\Z)',
     ]
     
     cert_section = ""
@@ -1906,7 +2248,7 @@ def extract_certifications(text: str) -> List[str]:
             line = re.sub(r'^[•·\-\*]\s*', '', line.strip())
             if line and 3 < len(line) < 200:
                 # Skip section headers and experience lines
-                if re.match(r'^(PROFESSIONAL|EXPERIENCE|IMG|IBM|Cognizant|Dell|Wipro)', line, re.IGNORECASE):
+                if re.match(r'^(PROFESSIONAL|EXPERIENCE|IMG|IBM|Cognizant|Dell|Wipro|Tools|Work)', line, re.IGNORECASE):
                     continue
                 
                 # Clean "In Progress" suffix
@@ -2585,11 +2927,35 @@ async def parse_resume_full(params: ParseResumeInput) -> str:
     name = ' '.join(filter(None, name_parts))
     
     # Get location - prefer most recent job, fallback to contact
+    # Validate location to avoid picking up tech terms
+    def is_valid_location(loc: str) -> bool:
+        if not loc:
+            return False
+        loc_lower = loc.lower()
+        # Invalid if it contains tech terms
+        tech_terms = ['git', 'ci', 'cd', 'sql', 'aws', 'gcp', 'azure', 'python', 'java', 
+                      'docker', 'kubernetes', 'jenkins', 'powercenter', 'informatica',
+                      'oracle', 'teradata', 'snowflake', 'spark', 'kafka', 'hadoop',
+                      'linux', 'unix', 'windows', 'server', 'database', 'api', 'etl',
+                      'hp', 'ibm', 'sap', 'mongodb', 'mysql', 'postgres', 'redis']
+        if any(term in loc_lower for term in tech_terms):
+            return False
+        # Must contain at least one valid location indicator
+        valid_indicators = ['usa', 'india', 'uk', 'canada', 'texas', 'tx', 'ca', 'ny', 
+                           'il', 'pa', 'ga', 'nc', 'va', 'nj', 'ma', 'fl', 'oh', 'wa',
+                           'chicago', 'dallas', 'plano', 'houston', 'atlanta', 'new york',
+                           'bangalore', 'bengaluru', 'hyderabad', 'pune', 'mumbai', 'chennai',
+                           'france', 'germany', 'london', 'singapore', 'remote']
+        return any(ind in loc_lower for ind in valid_indicators)
+    
     location = ""
     if experiences and experiences[0].location:
-        location = experiences[0].location
+        if is_valid_location(experiences[0].location):
+            location = experiences[0].location
     if not location:
-        location = contact.get('location', '')
+        contact_loc = contact.get('location', '')
+        if is_valid_location(contact_loc):
+            location = contact_loc
     
     # Calculate skills with experience
     key_skills = calculate_key_skills(text, experiences)
