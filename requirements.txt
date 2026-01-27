@@ -1,31 +1,22 @@
-# Resume Parser MCP Server - Dependencies
-# ========================================
+FROM python:3.11-slim
 
-# MCP Server Framework
-mcp>=1.0.0
+WORKDIR /app
 
-# Data Validation
-pydantic>=2.0.0
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 
-# Date Handling
-python-dateutil>=2.8.0
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# REST API Framework (for Swagger UI)
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
+# Copy application files
+COPY intelligent_parser.py .
+COPY resume_parser_mcp.py .
+COPY api_server.py .
 
-# File Upload Support
-python-multipart>=0.0.6
+# Expose port
+EXPOSE 8000
 
-# PDF Extraction
-PyPDF2>=3.0.0
-pdfplumber>=0.10.0
-
-# Word Document Extraction
-python-docx>=1.0.0
-
-# HTTP Client (for external API calls if needed)
-httpx>=0.26.0
-
-# ASGI Server for production
-gunicorn>=21.0.0
+# Run the server
+CMD ["python", "api_server.py"]
