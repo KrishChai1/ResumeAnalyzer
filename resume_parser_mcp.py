@@ -1042,6 +1042,7 @@ def extract_responsibilities(lines: List[str], start_idx: int) -> List[str]:
     """Extract responsibilities starting from given index."""
     responsibilities = []
     date_pattern = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}\s*[-–]'
+    date_pattern_mm = r'^\d{2}/\d{4}\s*[-–]'  # MM/YYYY format
     
     j = start_idx
     while j < len(lines) and j < start_idx + 30:
@@ -1050,14 +1051,21 @@ def extract_responsibilities(lines: List[str], start_idx: int) -> List[str]:
         # Stop conditions
         if re.search(date_pattern, resp_line, re.IGNORECASE):
             break
+        if re.match(date_pattern_mm, resp_line):
+            break
         if re.match(r'^(EDUCATION|TECHNICAL|SKILLS|CERTIFICATIONS|PERSONAL|KEY\s+ARCH|PROFESSIONAL\s+EXPERIENCE)', resp_line, re.IGNORECASE):
             break
         if re.match(r'^[A-Z][A-Za-z\s&]+(?:Ltd|Inc|Corp|Technologies|Solutions)?\s*[-–]\s*[A-Z]', resp_line):
             break
         
-        # Extract bullet points
-        if resp_line.startswith(('•', '-', '*', '–')) or re.match(r'^\d+\.', resp_line):
-            resp_text = re.sub(r'^[•\-\*–\d.]\s*', '', resp_line)
+        # Extract bullet points - include ■ (black square) used in some PDFs
+        if resp_line.startswith(('•', '-', '*', '–', '■')) or re.match(r'^\d+\.', resp_line):
+            resp_text = re.sub(r'^[•\-\*–■\d.]\s*', '', resp_line)
+            if len(resp_text) > 20:
+                responsibilities.append(clean_output_text(resp_text))
+        # Also check for lines ending with ■ (some PDFs format this way)
+        elif resp_line.endswith('■'):
+            resp_text = resp_line.rstrip('■').strip()
             if len(resp_text) > 20:
                 responsibilities.append(clean_output_text(resp_text))
         
@@ -1390,7 +1398,7 @@ def extract_experiences(text: str) -> List[ExperienceEntry]:
                 start_date = f"{start_year}-{start_month:02d}"
                 end_date = f"{end_year}-{end_month:02d}"
                 
-                # Get responsibilities (lines starting with bullets after the date)
+                # Get responsibilities (lines starting OR ending with bullets after the date)
                 responsibilities = []
                 j = i + 2
                 while j < len(lines) and j < i + 30:
@@ -1400,8 +1408,16 @@ def extract_experiences(text: str) -> List[ExperienceEntry]:
                         break
                     if re.match(r'^[A-Z][a-z]+\s+[A-Z][a-z]+\s+[A-Z]', resp_line):  # New title
                         break
+                    if re.match(r'^(Senior|Junior|Lead)\s+', resp_line, re.IGNORECASE):  # New job
+                        break
+                    # Lines starting with bullet
                     if resp_line.startswith(('■', '•', '-', '*')):
                         resp = re.sub(r'^[■•\-\*]\s*', '', resp_line)
+                        if len(resp) > 20:
+                            responsibilities.append(clean_output_text(resp))
+                    # Lines ending with bullet (Javvaji PDF style)
+                    elif resp_line.endswith('■'):
+                        resp = resp_line.rstrip('■').strip()
                         if len(resp) > 20:
                             responsibilities.append(clean_output_text(resp))
                     j += 1
@@ -1458,8 +1474,9 @@ def extract_experiences(text: str) -> List[ExperienceEntry]:
                     title = role_match.group(1).strip()
                     break
             
-            # Get responsibilities (bullet points after ROLE line)
+            # Get responsibilities (bullet points OR plain text after ROLE line)
             if title:
+                in_responsibilities = False
                 for j in range(i + 1, min(i + 50, len(lines))):
                     resp_line = lines[j].strip()
                     # Stop at next company header
@@ -1467,10 +1484,20 @@ def extract_experiences(text: str) -> List[ExperienceEntry]:
                         break
                     if resp_line.startswith('---'):
                         break
+                    # Check if we've entered responsibilities section
+                    if 'responsibilities' in resp_line.lower() and resp_line.endswith(':'):
+                        in_responsibilities = True
+                        continue
+                    # Extract bullet points
                     if resp_line.startswith(('•', '-', '*')):
                         resp = re.sub(r'^[•\-\*]\s*', '', resp_line)
                         if len(resp) > 20:
                             responsibilities.append(clean_output_text(resp))
+                    # Extract plain text lines in responsibilities section
+                    elif in_responsibilities and len(resp_line) > 30 and resp_line[0].isupper():
+                        # Skip section headers
+                        if not resp_line.startswith(('Work Location', 'ROLE:', 'DESIGNATION:')):
+                            responsibilities.append(clean_output_text(resp_line))
             
             duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
             start_date = f"{start_year}-{(start_month or 1):02d}"
@@ -1545,55 +1572,88 @@ def extract_experiences(text: str) -> List[ExperienceEntry]:
     # Strategy 3: "Client: Company – Location Date" then "Title" (Naveen style)
     # Example: "Client: Ascent Global Logistics – Atlanta, GA.    Jul24 to Present"
     # Also handles: "Client: Hiscox Inc - Atlanta, Georgia Feb'20 to May'21"
-    client_pattern = r"^Client:\s*(.+?)[-–]\s*([A-Za-z\s,]+\.?)\s+(\w{3}['\u2019]?\d{2})\s+to\s+(\w{3}['\u2019]?\d{2}|Present|P)$"
+    # IMPORTANT: Handle company names with hyphens like "Co-Op Financial"
+    
+    # Pattern: Look for "Client:" then find the LAST dash before a location pattern (City, State format)
     lines = text.split('\n')
     for i, line in enumerate(lines):
-        match = re.match(client_pattern, line.strip(), re.IGNORECASE)
-        if match:
-            employer = match.group(1).strip()
-            location = match.group(2).strip().rstrip('.')
-            start_str = match.group(3)
-            end_str = match.group(4)
+        if not line.strip().lower().startswith('client:'):
+            continue
             
-            # Convert short date format (Jul24 -> July 2024, Feb'20 -> Feb 2020)
-            start_year, start_month, _ = parse_date(start_str)
-            end_year, end_month, is_present = parse_date(end_str)
-            
-            if start_year and end_year:
-                # Next line should be title
-                title = ""
-                if i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
-                    if next_line and not next_line.startswith(('Client:', 'Environment:', 'Description:', 'Responsibilities:')):
-                        title = next_line
-                
-                # Get responsibilities
-                responsibilities = []
-                for j in range(i + 2, min(i + 30, len(lines))):
-                    resp_line = lines[j].strip()
-                    if resp_line.startswith('Client:') or resp_line.startswith('Environment:'):
-                        break
-                    if resp_line.startswith(('•', '-', '*')) or (resp_line and not resp_line.startswith(('Description:', 'Responsibilities:'))):
-                        resp = re.sub(r'^[•\-\*]\s*', '', resp_line)
-                        if len(resp) > 20:
-                            responsibilities.append(clean_output_text(resp))
-                
-                duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
-                start_date = f"{start_year}-{(start_month or 1):02d}"
-                end_date = f"{end_year}-{(end_month or 12):02d}" if not is_present else f"{datetime.now().year}-{datetime.now().month:02d}"
-                
-                is_dup = any(e.employer == employer and e.start_date == start_date for e in experiences)
-                if not is_dup:
-                    experiences.append(ExperienceEntry(
-                        employer=employer,
-                        title=title,
-                        location=location,
-                        start_date=start_date,
-                        end_date=end_date,
-                        duration_months=duration,
-                        responsibilities=responsibilities[:12],
-                        tools=extract_tools_from_text(' '.join(responsibilities))
-                    ))
+        # Find date at end of line (formats: Jul24, Jun21, Feb'20, Present, P)
+        date_end_match = re.search(r"(\w{3}['\u2019]?\d{2})\s+to\s+(\w{3}['\u2019]?\d{2}|Present|P)\s*$", line.strip(), re.IGNORECASE)
+        if not date_end_match:
+            continue
+        
+        # Extract the part before dates
+        before_date = line[:date_end_match.start()].strip()
+        start_str = date_end_match.group(1)
+        end_str = date_end_match.group(2)
+        
+        # Parse: "Client: Company – Location"
+        # Find the LAST occurrence of " - " or " – " that's followed by a location pattern
+        # Location patterns: "City, State", "City, State.", "City State"
+        client_prefix = re.match(r'^Client:\s*', before_date, re.IGNORECASE)
+        if not client_prefix:
+            continue
+        after_client = before_date[client_prefix.end():]
+        
+        # Look for location patterns: "City, State" or "City State" at the end
+        loc_patterns = [
+            r'\s+[-–]\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?,?\s*(?:GA|TX|CA|NY|IL|PA|OH|IA|FL|NC|VA|MA|NJ|WA|CO|AZ|TN|MO|MD|WI|MN|IN|OR|NV|UT|KS|AR|NE|NM|WV|ID|HI|ME|NH|RI|MT|DE|SD|ND|AK|VT|WY|DC|India|USA|Georgia|Texas|California)\.?)\s*$',
+        ]
+        
+        employer = after_client.strip()
+        location = ""
+        
+        for loc_pat in loc_patterns:
+            loc_match = re.search(loc_pat, after_client, re.IGNORECASE)
+            if loc_match:
+                employer = after_client[:loc_match.start()].strip()
+                location = loc_match.group(1).strip().rstrip('.')
+                break
+        
+        # Parse dates
+        start_year, start_month, _ = parse_date(start_str)
+        end_year, end_month, is_present = parse_date(end_str)
+        
+        if not start_year or not end_year:
+            continue
+        
+        # Next line should be title
+        title = ""
+        if i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if next_line and not next_line.startswith(('Client:', 'Environment:', 'Description:', 'Responsibilities:')):
+                title = next_line
+        
+        # Get responsibilities
+        responsibilities = []
+        for j in range(i + 2, min(i + 40, len(lines))):
+            resp_line = lines[j].strip()
+            if resp_line.lower().startswith('client:') or resp_line.lower().startswith('environment:'):
+                break
+            if resp_line.startswith(('•', '-', '*', '■')) or (resp_line and not resp_line.startswith(('Description:', 'Responsibilities:'))):
+                resp = re.sub(r'^[•\-\*■]\s*', '', resp_line)
+                if len(resp) > 20:
+                    responsibilities.append(clean_output_text(resp))
+        
+        duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
+        start_date = f"{start_year}-{(start_month or 1):02d}"
+        end_date = f"{end_year}-{(end_month or 12):02d}" if not is_present else f"{datetime.now().year}-{datetime.now().month:02d}"
+        
+        is_dup = any(e.employer == employer and e.start_date == start_date for e in experiences)
+        if not is_dup and employer:
+            experiences.append(ExperienceEntry(
+                employer=employer,
+                title=title,
+                location=location,
+                start_date=start_date,
+                end_date=end_date,
+                duration_months=duration,
+                responsibilities=responsibilities[:12],
+                tools=extract_tools_from_text(' '.join(responsibilities))
+            ))
     
     # Strategy 4: Table-based "Client: X | Duration: Date" (Ramaswamy style)
     table_client_pattern = r'Client:\s*([^\|]+)'
@@ -2209,12 +2269,25 @@ def extract_education(text: str) -> List[Dict[str, str]]:
             
             i += 1
     
-    # Ensure all entries have all fields (null if missing)
+    # Ensure all entries have all fields (null if missing) and clean up
     cleaned = []
     for edu in education:
+        degree = edu.get('degree') or None
+        institution = edu.get('institution') or None
+        
+        # Clean leading pipe characters (Ramaswamy issue)
+        if degree:
+            degree = re.sub(r'^[\|\s]+', '', degree).strip()
+        if institution:
+            institution = re.sub(r'^[\|\s]+', '', institution).strip()
+        
+        # Skip if degree is empty after cleanup
+        if not degree:
+            continue
+            
         cleaned.append({
-            'degree': edu.get('degree') or None,
-            'institution': edu.get('institution') or None,
+            'degree': degree,
+            'institution': institution if institution else None,
             'year': edu.get('year') or None
         })
     
