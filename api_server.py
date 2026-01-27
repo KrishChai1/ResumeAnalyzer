@@ -1,51 +1,35 @@
 """
-Resume Parser API Server v3.1
-==============================
-FastAPI server with Swagger UI using Enterprise Resume Parser.
-Includes Claude AI validation for complex/difficult resumes.
+Resume Parser API Server v3.2
+=============================
+FastAPI server with intelligent AI-first parsing + regex fallback.
 """
 
 import os
-import io
-import json
+import asyncio
 import tempfile
 from typing import Optional
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from resume_parser_mcp import (
-    parse_resume_full, ParseResumeInput, normalize_text, ANTHROPIC_API_KEY,
-    extract_all_text_from_docx
-)
+# Configuration
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 app = FastAPI(
-    title="Enterprise Resume Parser API",
+    title="Resume Parser API",
     description="""
-## Enterprise-Grade Agentic Resume Parser v3.1
+## Intelligent Resume Parser with AI-First Approach
 
-### Architecture:
-- **Multi-Strategy Extraction**: 11+ extraction patterns
-- **Validation Agent**: Quality scoring (0-100)
-- **AI Fallback**: Claude API automatically triggered for score < 60
+### Features:
+- **AI-First**: Uses Claude AI for intelligent extraction (any format)
+- **Regex Fallback**: Reliable backup when AI unavailable
+- **Multi-format**: PDF, DOCX, TXT support
+- **Enterprise Grade**: Handles complex layouts, tables, text boxes
 
-### Supported Formats:
-- PIPE: `Title | Company | Date`
-- SLASH_DATE: `MM/YYYY - MM/YYYY` (Javvaji style)
-- ROLE_BASED: `Company Date` then `ROLE: Title` (Sarwar style)
-- CLIENT_DATE: `Client: Company – Location Date` (Naveen style)
-- WORKED_AS: `Worked as X in Y from A to B`
-- TABLE: Structured tables (Ramaswamy style)
-- TEXTBOX: Multi-column layouts (Nageswara style)
-
-### AI Validation:
-Set `ANTHROPIC_API_KEY` environment variable to enable.
-AI fallback triggers automatically when:
-- Validation score < 60
-- Name is missing or invalid
-- Critical fields are missing
+### Configuration:
+Set `ANTHROPIC_API_KEY` environment variable for AI-powered parsing.
     """,
-    version="3.1.0",
+    version="3.2.0",
     docs_url="/docs"
 )
 
@@ -60,98 +44,101 @@ app.add_middleware(
 
 class ParseTextRequest(BaseModel):
     text: str = Field(..., min_length=50)
-    use_ai_validation: bool = Field(default=True)
+    use_ai: bool = Field(default=True)
+    filename: Optional[str] = Field(default=None)
+
+
+class ExtractSkillsRequest(BaseModel):
+    text: str = Field(..., min_length=10)
 
 
 @app.get("/", tags=["Info"])
 async def root():
     return {
-        "name": "Enterprise Resume Parser API",
-        "version": "3.1.0",
+        "name": "Resume Parser API",
+        "version": "3.2.0",
         "docs": "/docs",
-        "ai_available": bool(ANTHROPIC_API_KEY),
-        "ai_status": "enabled" if ANTHROPIC_API_KEY else "disabled (set ANTHROPIC_API_KEY)",
-        "supported_formats": ["pdf", "docx", "doc", "txt"]
+        "ai_enabled": bool(ANTHROPIC_API_KEY),
+        "mode": "AI-First" if ANTHROPIC_API_KEY else "Regex-Only"
     }
 
 
 @app.get("/health", tags=["Health"])
 async def health_check():
     return {
-        "status": "healthy", 
+        "status": "healthy",
         "ai_available": bool(ANTHROPIC_API_KEY),
-        "message": "AI validation ready" if ANTHROPIC_API_KEY else "AI validation disabled - set ANTHROPIC_API_KEY"
+        "parser_mode": "intelligent" if ANTHROPIC_API_KEY else "regex"
     }
 
 
 @app.post("/parse/file", tags=["Parsing"])
 async def parse_file(
     file: UploadFile = File(...),
-    use_ai_validation: bool = Form(default=True)
+    use_ai: bool = Form(default=True)
 ):
     """
     Parse resume from PDF/DOCX file.
     
-    - **file**: Resume file (PDF, DOCX, DOC, or TXT)
-    - **use_ai_validation**: Enable Claude AI fallback for difficult resumes (default: True)
-    
-    Returns structured JSON with:
-    - parsed_resume: All extracted fields
-    - validation_score: Quality score 0-100
-    - validation_issues: List of any problems found
-    - ai_enhanced: True if Claude AI was used to fix issues
+    - **file**: Resume file (PDF, DOCX, TXT)
+    - **use_ai**: Enable AI-powered parsing (default: true)
     """
     if not file.filename:
         raise HTTPException(400, "No file provided")
     
     ext = file.filename.lower().split('.')[-1]
     if ext not in ['pdf', 'docx', 'doc', 'txt']:
-        raise HTTPException(400, f"Unsupported format: {ext}. Use PDF, DOCX, DOC, or TXT.")
+        raise HTTPException(400, f"Unsupported format: {ext}")
     
     try:
         content = await file.read()
-        file_path = None
         
-        # Extract text based on file type
-        if ext == 'pdf':
-            text = extract_pdf(content)
-        elif ext in ['docx', 'doc']:
-            # Save to temp file for table/textbox extraction
-            with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
-                tmp.write(content)
-                file_path = tmp.name
+        # Save to temp file for enhanced extraction
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{ext}') as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        try:
+            # Extract text based on format
+            if ext == 'pdf':
+                text = extract_pdf_text(tmp_path)
+            elif ext in ['docx', 'doc']:
+                text = extract_docx_text(tmp_path)
+            else:
+                text = content.decode('utf-8', errors='ignore')
             
-            # Extract text including tables and textboxes
-            text = extract_all_text_from_docx(file_path)
-        else:
-            text = content.decode('utf-8', errors='ignore')
+            if len(text.strip()) < 50:
+                raise HTTPException(400, "Insufficient text extracted from file")
+            
+            # Parse using appropriate method
+            if use_ai and ANTHROPIC_API_KEY:
+                from intelligent_parser import parse_resume_intelligent
+                result = await parse_resume_intelligent(
+                    text=text,
+                    filename=file.filename,
+                    file_path=tmp_path
+                )
+            else:
+                from resume_parser_mcp import parse_resume_full, ParseResumeInput, normalize_text
+                text = normalize_text(text)
+                result = await parse_resume_full(ParseResumeInput(
+                    resume_text=text,
+                    filename=file.filename,
+                    file_path=tmp_path,
+                    use_ai_validation=False
+                ))
+            
+            import json
+            return json.loads(result)
         
-        text = normalize_text(text)
-        
-        if len(text.strip()) < 50:
-            raise HTTPException(400, "Insufficient text extracted from file. The file may be empty or corrupted.")
-        
-        # Parse using enterprise parser with AI fallback
-        result = await parse_resume_full(ParseResumeInput(
-            resume_text=text,
-            filename=file.filename,
-            file_path=file_path,
-            use_ai_validation=use_ai_validation
-        ))
-        
-        # Clean up temp file
-        if file_path and os.path.exists(file_path):
-            try:
-                os.unlink(file_path)
-            except:
-                pass
-        
-        return json.loads(result)
+        finally:
+            # Clean up temp file
+            os.unlink(tmp_path)
     
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Error parsing resume: {str(e)}")
+        raise HTTPException(500, f"Parsing error: {str(e)}")
 
 
 @app.post("/parse", tags=["Parsing"])
@@ -159,53 +146,89 @@ async def parse_text(request: ParseTextRequest):
     """
     Parse resume from plain text.
     
-    - **text**: Resume text (minimum 50 characters)
-    - **use_ai_validation**: Enable Claude AI fallback (default: True)
+    - **text**: Resume text content
+    - **use_ai**: Enable AI-powered parsing (default: true)
     """
     try:
-        result = await parse_resume_full(ParseResumeInput(
-            resume_text=request.text,
-            use_ai_validation=request.use_ai_validation
-        ))
+        if request.use_ai and ANTHROPIC_API_KEY:
+            from intelligent_parser import parse_resume_intelligent
+            result = await parse_resume_intelligent(
+                text=request.text,
+                filename=request.filename or ""
+            )
+        else:
+            from resume_parser_mcp import parse_resume_full, ParseResumeInput, normalize_text
+            result = await parse_resume_full(ParseResumeInput(
+                resume_text=normalize_text(request.text),
+                filename=request.filename,
+                use_ai_validation=False
+            ))
+        
+        import json
         return json.loads(result)
     except Exception as e:
-        raise HTTPException(500, f"Error: {str(e)}")
+        raise HTTPException(500, f"Parsing error: {str(e)}")
 
 
-def extract_pdf(content: bytes) -> str:
-    """Extract text from PDF with fallback."""
+def extract_pdf_text(file_path: str) -> str:
+    """Extract text from PDF using multiple methods."""
     text = ""
     
-    # Try pdfplumber first (better formatting)
+    # Try pdfplumber first
     try:
         import pdfplumber
-        with pdfplumber.open(io.BytesIO(content)) as pdf:
+        with pdfplumber.open(file_path) as pdf:
             text = '\n'.join([p.extract_text() or '' for p in pdf.pages])
-    except Exception:
+    except:
         pass
     
-    # Fallback to PyPDF2 if pdfplumber fails or returns too little text
+    # Fallback to PyPDF2
     if len(text.strip()) < 100:
         try:
             from PyPDF2 import PdfReader
-            reader = PdfReader(io.BytesIO(content))
+            reader = PdfReader(file_path)
             text = '\n'.join([p.extract_text() or '' for p in reader.pages])
-        except Exception:
+        except:
             pass
     
     return text
 
 
-def extract_docx(content: bytes) -> str:
-    """Extract text from DOCX."""
+def extract_docx_text(file_path: str) -> str:
+    """Extract ALL text from DOCX including tables and text boxes."""
     from docx import Document
-    doc = Document(io.BytesIO(content))
-    return '\n'.join([p.text for p in doc.paragraphs if p.text.strip()])
+    doc = Document(file_path)
+    
+    all_text = []
+    
+    # Paragraphs
+    for para in doc.paragraphs:
+        if para.text.strip():
+            all_text.append(para.text.strip())
+    
+    # Tables
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if row_text:
+                all_text.append(' | '.join(row_text))
+    
+    # Text boxes
+    try:
+        for txbx in doc.element.iter():
+            if txbx.tag.endswith('txbxContent'):
+                texts = [t.text for t in txbx.iter() if t.tag.endswith('}t') and t.text]
+                if texts:
+                    content = ' '.join(texts)
+                    if content not in all_text:
+                        all_text.append(content)
+    except:
+        pass
+    
+    return '\n'.join(all_text)
 
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    print(f"Starting Enterprise Resume Parser API on port {port}")
-    print(f"AI Validation: {'ENABLED' if ANTHROPIC_API_KEY else 'DISABLED (set ANTHROPIC_API_KEY)'}")
     uvicorn.run(app, host="0.0.0.0", port=port)
