@@ -588,10 +588,11 @@ def extract_contact(text: str) -> Dict[str, str]:
                 contact['phone'] = phone
                 break
     
-    # LinkedIn - multiple patterns
+    # LinkedIn - multiple patterns (handle spaces from PDF extraction)
     linkedin_patterns = [
-        r'linkedin\.com/in/([\w-]+)',
-        r'linkedin[:\s]+(?:www\.)?linkedin\.com/in/([\w-]+)',
+        r'linkedin\.com\s*/in/([\w-]+)',  # with optional space after .com
+        r'linkedin\.com\s*/?\s*in/([\w-]+)',  # with optional spaces around /in
+        r'linkedin[:\s]+(?:www\.)?linkedin\.com\s*/in/([\w-]+)',
         r'LinkedIn[:\s]+([\w]+)(?:\s|$)',
     ]
     for pattern in linkedin_patterns:
@@ -1515,6 +1516,115 @@ def extract_experiences(text: str) -> List[ExperienceEntry]:
                     responsibilities=responsibilities[:12]
                 ))
     
+    # Strategy 0d: "Title" then "Company | Account | Location | YYYY - Present/YYYY" (Chaitu style)
+    # Handles multiple pipe variations:
+    # - 3 pipes (4 sections): "Tech Mahindra | UPS Account | Alpharetta, GA | 2024 – Present"
+    # - 2 pipes (3 sections): "Samsung Electronics | Plano, TX | 2020 – 2024"
+    # - 2 pipes (3 sections): "TCS | Multiple Fortune 500 Clients | 2005 – 2012"
+    
+    # Pattern for 3 pipes (Company | Account | Location | Date)
+    pipe3_pattern = r'^(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(\d{4})\s*[-–]\s*(\d{4}|Present|Current)\s*$'
+    # Pattern for 2 pipes (Company | Location/Clients | Date)
+    pipe2_pattern = r'^(.+?)\s*\|\s*(.+?)\s*\|\s*(\d{4})\s*[-–]\s*(\d{4}|Present|Current)\s*$'
+    
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+        
+        employer = ""
+        client_or_account = ""
+        location = ""
+        start_year = None
+        end_str = ""
+        
+        # Try 3-pipe pattern first
+        match3 = re.match(pipe3_pattern, line_stripped, re.IGNORECASE)
+        if match3:
+            employer = match3.group(1).strip()
+            client_or_account = match3.group(2).strip()
+            location = match3.group(3).strip()
+            start_year = int(match3.group(4))
+            end_str = match3.group(5)
+        else:
+            # Try 2-pipe pattern
+            match2 = re.match(pipe2_pattern, line_stripped, re.IGNORECASE)
+            if match2:
+                employer = match2.group(1).strip()
+                loc_or_client = match2.group(2).strip()
+                start_year = int(match2.group(3))
+                end_str = match2.group(4)
+                
+                # Determine if second part is location or client
+                # Location: contains state abbrev or city pattern
+                if re.search(r',\s*[A-Z]{2}\b', loc_or_client) or re.search(r'\b[A-Z][a-z]+\s*,\s*[A-Z]{2}\b', loc_or_client):
+                    location = loc_or_client
+                else:
+                    # Treat as client/description
+                    client_or_account = loc_or_client
+        
+        if not start_year:
+            continue
+        
+        # Skip if employer is empty or looks like education
+        if not employer or employer.lower().startswith(('executive', 'bachelor', 'master', 'mba')):
+            continue
+        
+        # Get title from previous line
+        title = ""
+        if i > 0:
+            prev_line = lines[i - 1].strip()
+            # Make sure it's not a section header, bullet point, or another pipe line
+            if prev_line and not prev_line.startswith(('•', '▪', '-', '*', 'PROFESSIONAL', 'WORK', 'EXPERIENCE', 'AREAS')):
+                if '|' not in prev_line and not re.search(r'\d{4}\s*[-–]', prev_line):
+                    # Skip if it's a responsibility/bullet continuation
+                    if not any(prev_line.lower().startswith(w) for w in ['ensuring', 'targeting', 'serving', 'driving']):
+                        title = prev_line
+        
+        # Parse end year
+        if end_str.lower() in ['present', 'current']:
+            end_year = datetime.now().year
+            end_month = datetime.now().month
+            is_present = True
+        else:
+            end_year = int(end_str)
+            end_month = 12
+            is_present = False
+        
+        # Calculate duration (use January for start, December/current for end)
+        duration = calculate_duration(start_year, 1, end_year, end_month)
+        start_date = f"{start_year}-01"
+        end_date = f"{end_year}-{end_month:02d}"
+        
+        # Get responsibilities (lines starting with ▪ or •)
+        responsibilities = []
+        j = i + 1
+        while j < len(lines) and j < i + 30:
+            resp_line = lines[j].strip()
+            # Stop at next job header (pipe with year pattern)
+            if re.search(r'\|\s*\d{4}\s*[-–]', resp_line):
+                break
+            # Stop at section headers
+            if resp_line.upper().startswith(('EDUCATION', 'CERTIFICATIONS', 'TECHNICAL', 'SKILLS', 'AREAS OF')):
+                break
+            # Extract bullet points (▪, •, -, *)
+            if resp_line.startswith(('▪', '•', '-', '*')):
+                resp = re.sub(r'^[▪•\-\*]\s*', '', resp_line)
+                if len(resp) > 20:
+                    responsibilities.append(clean_output_text(resp))
+            j += 1
+        
+        is_dup = any(e.employer == employer and e.start_date == start_date for e in experiences)
+        if not is_dup and employer:
+            experiences.append(ExperienceEntry(
+                employer=employer,
+                title=title if title else "Professional",
+                location=location,
+                start_date=start_date,
+                end_date=end_date,
+                duration_months=duration,
+                responsibilities=responsibilities[:12],
+                client=client_or_account if client_or_account else ""
+            ))
+    
     # Strategy 1: "Worked as X in Y from A to B" format
     worked_pattern = r'[Ww]ork(?:ed|ing)\s+(?:as\s+)?(?:a\s+)?(.+?)\s+in\s+(.+?)\s+from\s+(\w+\s+\d{4})\s+to\s+(\w+\s+\d{4}|Present|Current)'
     for match in re.finditer(worked_pattern, text, re.IGNORECASE):
@@ -2054,10 +2164,11 @@ def extract_education(text: str) -> List[Dict[str, str]]:
         return any(re.search(p, text_lower) for p in job_title_patterns)
     
     # Find education section (multiple possible headers)
-    # Note: Be specific to avoid matching "TECHNICAL QUALIFICATION"
+    # IMPORTANT: Require EDUCATION to be at the START of a line (section header)
+    # This avoids matching "executive education" in the middle of text
     edu_match = re.search(
-        r'(?:EDUCATION(?:AL)?\s*(?:QUALIFICATION|BACKGROUND|DETAILS)?|ACADEMIC\s*(?:QUALIFICATION|BACKGROUND)?)[:\s]*\n?(.+?)(?:\nROLES|\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nPERSONAL|\nCERTIFI|\nCORE|\nAS\s+A\s+SCRUM|\nSKILLS|\nACHIEVEMENT|\nTOOLS|\n_+|\Z)',
-        text, re.IGNORECASE | re.DOTALL
+        r'^(?:EDUCATION(?:AL)?\s*(?:QUALIFICATION|BACKGROUND|DETAILS)?|ACADEMIC\s*(?:QUALIFICATION|BACKGROUND)?)[:\s]*\n(.+?)(?:\nROLES|\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nPERSONAL|\nCERTIFI|\nCORE|\nAS\s+A\s+SCRUM|\nSKILLS|\nACHIEVEMENT|\nTOOLS|\n_+|\Z)',
+        text, re.IGNORECASE | re.DOTALL | re.MULTILINE
     )
     
     # Also try inline patterns like "Masters in X from Y University"
@@ -2134,6 +2245,23 @@ def extract_education(text: str) -> List[Dict[str, str]]:
             
             # Skip irrelevant lines
             if re.match(r'^(Worked|Working|•|-|\*|PROFESSIONAL|Roles|As\s+a\s+Scrum|Facilitate|Client:|Role|Analysis|Find|Set up|Duration)', line, re.IGNORECASE):
+                i += 1
+                continue
+            
+            # CRITICAL: Skip lines that look like job/company headers (pipe with year range AND location)
+            # Example to skip: "Samsung Electronics | Plano, TX | 2020 - 2024"
+            # Example to keep: "Master of Computer Applications (MCA) - IGNOU | 2001-2004"
+            # The difference: job headers have pipe BEFORE the year with location pattern
+            if re.search(r'\|\s*[A-Za-z]+\s*,\s*[A-Z]{2}\s*\|\s*\d{4}\s*[-–]', line, re.IGNORECASE):
+                i += 1
+                continue
+            # Also skip if it looks like: "Company | Description | YYYY - Present" (without location but with Present)
+            if re.search(r'\|\s*\d{4}\s*[-–]\s*(?:Present|Current)', line, re.IGNORECASE):
+                i += 1
+                continue
+            
+            # Skip lines that are extra details about education (Specializations, Assistant VP, etc.)
+            if line.lower().startswith(('specialization', 'assistant', 'dean', 'scholar', 'president', 'vice')):
                 i += 1
                 continue
             
@@ -2303,10 +2431,11 @@ def extract_certifications(text: str) -> List[str]:
     certifications = []
     
     # Multiple section patterns - handle various headers
+    # IMPORTANT: Stop at TECHNICAL header (TECHNICAL EXPERTISE, TECHNICAL SKILLS, etc.)
     cert_patterns = [
-        r'CERTIFICATIONS?\s*[/&]?\s*(?:TRAININGS?)?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nEDUCATION|\nSKILLS|\nTOOLS|\nWORK|\Z)',
-        r'CERTIFICATES?\s*[/&]?\s*(?:TRAININGS?)?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nTOOLS|\Z)',
-        r'TRAININGS?\s*[/&]?\s*(?:CERTIFICATIONS?)?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nSKILLS|\nTOOLS|\Z)',
+        r'CERTIFICATIONS?\s*[/&]?\s*(?:TRAININGS?)?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nEDUCATION|\nSKILLS|\nTOOLS|\nWORK|\nTECHNICAL|\Z)',
+        r'CERTIFICATES?\s*[/&]?\s*(?:TRAININGS?)?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nTOOLS|\nTECHNICAL|\Z)',
+        r'TRAININGS?\s*[/&]?\s*(?:CERTIFICATIONS?)?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nSKILLS|\nTOOLS|\nTECHNICAL|\Z)',
     ]
     
     cert_section = ""
@@ -2321,7 +2450,11 @@ def extract_certifications(text: str) -> List[str]:
             line = re.sub(r'^[•·\-\*]\s*', '', line.strip())
             if line and 3 < len(line) < 200:
                 # Skip section headers and experience lines
-                if re.match(r'^(PROFESSIONAL|EXPERIENCE|IMG|IBM|Cognizant|Dell|Wipro|Tools|Work)', line, re.IGNORECASE):
+                if re.match(r'^(PROFESSIONAL|EXPERIENCE|IMG|IBM|Cognizant|Dell|Wipro|Tools|Work|TECHNICAL|AI/ML|Platforms|Cloud|Data:)', line, re.IGNORECASE):
+                    continue
+                
+                # Skip if line looks like technical skills (contains multiple commas with tech terms)
+                if line.count(',') >= 3 and any(t in line.lower() for t in ['python', 'java', 'aws', 'gcp', 'azure', 'docker']):
                     continue
                 
                 # Clean "In Progress" suffix
