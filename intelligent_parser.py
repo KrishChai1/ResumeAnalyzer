@@ -592,3 +592,4 @@ if __name__ == "__main__":
         asyncio.run(test_file(sys.argv[1]))
     else:
         print("Usage: python intelligent_parser.py <resume_file>")
+ 
