@@ -636,7 +636,9 @@ def extract_name(text: str) -> Tuple[str, str, str]:
         'experienced', 'skilled', 'dedicated', 'professional with', 'having',
         'languages', 'cloud', 'web applications', 'version', 'configuration',
         'operating', 'databases', 'tools', 'contact', 'phone', 'email', 'ph:',
-        'work experience', 'work location', 'key skills', 'domain:'
+        'work experience', 'work location', 'key skills', 'domain:',
+        'data engineering', 'software engineering', 'governance', 'with over',
+        'executive reporting', 'executive summary', 'total', 'years of'
     ]
     
     # Full patterns to skip (exact match after lowercase)
@@ -649,6 +651,10 @@ def extract_name(text: str) -> Tuple[str, str, str]:
     for line in lines:
         # Clean the line first (remove excessive whitespace)
         clean_line = ' '.join(line.split())
+        
+        # Remove markdown bold formatting: **name** or __name__ -> name
+        clean_line = re.sub(r'\*\*([^*]+)\*\*', r'\1', clean_line)
+        clean_line = re.sub(r'__([^_]+)__', r'\1', clean_line)
         
         # Remove contact info suffixes BEFORE checking skip patterns
         # "NAVEEN REDDY YADLA Contact: 470-505-9469" -> "NAVEEN REDDY YADLA"
@@ -1285,8 +1291,9 @@ def extract_experiences(text: str) -> List[ExperienceEntry]:
     experiences = []
     
     # Strategy 0: "Title | Company, Location | Date Range" format (Steven style)
-    # Example: "Sr.Cloud/DeVOPS Engineer | RElix, Tx | November 2022 – Present"
-    pipe_date_pattern = r'^([^|]+)\s*\|\s*([^|]+)\s*\|\s*((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})\s*[-–]\s*((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|Present|Current)$'
+    # Example: "Sr.Cloud/DeVOPS Engineer | RElix, Tx | November 2022 -- Present"
+    # Note: Uses [-–]+ to match single dash, en-dash, or double dash
+    pipe_date_pattern = r'^([^|]+)\s*\|\s*([^|]+)\s*\|\s*((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})\s*[-–]+\s*((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|Present|Current)$'
     for line in text.split('\n'):
         match = re.match(pipe_date_pattern, line.strip(), re.IGNORECASE)
         if match:
@@ -1321,6 +1328,90 @@ def extract_experiences(text: str) -> List[ExperienceEntry]:
                         end_date=end_date,
                         duration_months=duration
                     ))
+    
+    # Strategy 0a: "Title Company - Location MM/YYYY - MM/YYYY|Present" (Javvaji inline style)
+    # Example: "Senior Java Developer LOWE'S - USA 05/2023 - Present"
+    # Example: "Senior(Lead) Java Consultant Renault-Nissan - France & North America 02/2015 - 04/2023"
+    inline_mm_pattern = r'^(.+?)\s+(\d{2}/\d{4})\s*[-–]\s*(\d{2}/\d{4}|Present|Current)\s*$'
+    for line in text.split('\n'):
+        match = re.match(inline_mm_pattern, line.strip(), re.IGNORECASE)
+        if match:
+            header = match.group(1).strip()
+            start_str = match.group(2)
+            end_str = match.group(3)
+            
+            # Skip section headers
+            if header.upper() in ['EXPERIENCE', 'WORK EXPERIENCE', 'PROFESSIONAL EXPERIENCE', 'EMPLOYMENT']:
+                continue
+            
+            # Parse location from header
+            location = ""
+            loc_match = re.search(r'\s*[-–]\s*(USA|India|France|UK|Canada|Germany|North America|Europe|France & North America)\s*$', header, re.IGNORECASE)
+            if loc_match:
+                location = loc_match.group(1).strip()
+                header = header[:loc_match.start()].strip()
+            
+            # Split title and company
+            employer = ""
+            title = header
+            
+            # Pattern: Look for uppercase company at end (LOWE'S, IBM, etc.)
+            title_company_match = re.match(r'^(.+?)\s+([A-Z][A-Z\s&\']+(?:\'S)?)\s*$', header)
+            if title_company_match:
+                title = title_company_match.group(1).strip()
+                employer = title_company_match.group(2).strip()
+            else:
+                # Pattern: Look for company like "Renault-Nissan" at end
+                title_words = ['Developer', 'Engineer', 'Consultant', 'Manager', 'Analyst', 'Lead', 'Architect', 'Administrator']
+                for tw in title_words:
+                    idx = header.rfind(tw)
+                    if idx > 0:
+                        potential_title = header[:idx + len(tw)].strip()
+                        potential_employer = header[idx + len(tw):].strip()
+                        potential_employer = re.sub(r'^[\s\-–]+', '', potential_employer).strip()
+                        if potential_employer:
+                            title = potential_title
+                            employer = potential_employer
+                            break
+            
+            # Parse MM/YYYY dates
+            start_parts = start_str.split('/')
+            start_month = int(start_parts[0])
+            start_year = int(start_parts[1])
+            
+            if end_str.lower() in ['present', 'current']:
+                end_year = datetime.now().year
+                end_month = datetime.now().month
+                is_present = True
+            else:
+                end_parts = end_str.split('/')
+                end_month = int(end_parts[0])
+                end_year = int(end_parts[1])
+                is_present = False
+            
+            duration = calculate_duration(start_year, start_month, end_year, end_month)
+            start_date = f"{start_year}-{start_month:02d}"
+            end_date = f"{end_year}-{end_month:02d}"
+            
+            is_dup = any(e.title == title and e.start_date == start_date for e in experiences)
+            if not is_dup:
+                # Get responsibilities from following lines
+                lines = text.split('\n')
+                line_idx = lines.index(line.strip()) if line.strip() in lines else -1
+                responsibilities = []
+                if line_idx >= 0:
+                    responsibilities = extract_responsibilities(lines, line_idx + 1)
+                
+                experiences.append(ExperienceEntry(
+                    employer=employer,
+                    title=title,
+                    location=location,
+                    start_date=start_date,
+                    end_date=end_date,
+                    duration_months=duration,
+                    responsibilities=responsibilities[:12],
+                    tools=extract_tools_from_text(' '.join(responsibilities))
+                ))
     
     # Strategy 0b: "Title Company - Location" then "Date Range" on next line (Javvaji style)
     # Example: "Senior Java Developer LOWE'S - USA" then "05/2023 - Present"
@@ -2197,6 +2288,24 @@ def extract_education(text: str) -> List[Dict[str, str]]:
             
             education.append({
                 'degree': degree_str,
+                'institution': institution,
+                'year': None
+            })
+    
+    # Single-line "Education: Degree at/from Institution" format (Ramaswamy style)
+    # Example: "Education: Master of Computer Application (M.C.A) at Osmania University, India"
+    single_line_edu = re.search(
+        r'Education[:\s]+([A-Za-z]+(?:\'s)?\s+of\s+[A-Za-z\s()\.]+)\s+(?:at|from)\s+([A-Za-z\s]+(?:University|College|Institute)[A-Za-z\s,]*)',
+        text, re.IGNORECASE
+    )
+    if single_line_edu:
+        degree = single_line_edu.group(1).strip()
+        institution = single_line_edu.group(2).strip()
+        degree_key = degree.lower()
+        if degree_key not in seen_degrees:
+            seen_degrees.add(degree_key)
+            education.append({
+                'degree': degree,
                 'institution': institution,
                 'year': None
             })
