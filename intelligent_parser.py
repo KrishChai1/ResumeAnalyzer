@@ -1,595 +1,795 @@
 """
-Intelligent Resume Parser v3.0 - AI-First Approach
-===================================================
-Uses Claude AI as the primary extraction engine with regex as validation.
-Handles ANY resume format without hardcoded patterns.
+Intelligent Resume Parser v4.0 - Advanced Multi-Agent System
+=============================================================
+Enterprise-grade resume parsing with AI-first approach.
 
-Architecture:
-1. AI Primary Agent: Claude extracts all structured data
-2. Regex Validator: Validates and cleans AI output
-3. Quality Agent: Scores and ensures completeness
+AGENTS:
+1. EXTRACTION AGENT - AI-powered data extraction (Claude)
+2. RULES AGENT - Pattern-based extraction (regex fallback)
+3. VALIDATION AGENT - Quality scoring & data verification
+4. ENHANCEMENT AGENT - Gap filling & normalization
+
+Works with ANY resume format - no hardcoding required.
 """
 
-import json
-import re
 import os
+import re
+import json
 import asyncio
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass, field
-import unicodedata
-
-# Configuration
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # ============================================================================
-# TEXT PREPROCESSING
+# CONFIGURATION
 # ============================================================================
 
-def normalize_text(text: str) -> str:
-    """Clean and normalize resume text."""
-    if not text:
-        return ""
-    
-    # Fix common encoding issues
-    replacements = {
-        'â€"': '–', 'â€™': "'", 'â€œ': '"', 'â€': '"',
-        'Ã©': 'é', 'Ã¨': 'è', 'Ã ': 'à',
-        '\u2013': '-', '\u2014': '-', '–': '-',
-        '\u2019': "'", '\u2018': "'",
-        '\u201c': '"', '\u201d': '"',
-        '\u2022': '•', '\u00a0': ' ',
-        '\r\n': '\n', '\r': '\n', '\t': ' '
-    }
-    
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    
-    text = unicodedata.normalize('NFKC', text)
-    text = re.sub(r' +', ' ', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    
-    return text.strip()
+MONTH_MAP = {
+    'jan': 1, 'january': 1, 'feb': 2, 'february': 2, 'mar': 3, 'march': 3,
+    'apr': 4, 'april': 4, 'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7,
+    'aug': 8, 'august': 8, 'sep': 9, 'sept': 9, 'september': 9,
+    'oct': 10, 'october': 10, 'nov': 11, 'november': 11, 'dec': 12, 'december': 12
+}
 
+# ============================================================================
+# AGENT 1: EXTRACTION AGENT (AI-Powered)
+# ============================================================================
 
-def extract_text_from_pdf(file_path: str) -> str:
-    """Extract text from PDF using multiple methods."""
-    text = ""
+class ExtractionAgent:
+    """AI-powered extraction using Claude API."""
     
-    # Try pdfplumber first (better for complex layouts)
-    try:
-        import pdfplumber
-        with pdfplumber.open(file_path) as pdf:
-            text = '\n'.join([p.extract_text() or '' for p in pdf.pages])
-    except:
-        pass
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.model = "claude-sonnet-4-20250514"
     
-    # Fallback to PyPDF2
-    if len(text.strip()) < 100:
+    async def extract(self, text: str) -> Dict:
+        """Extract all resume data using Claude AI."""
+        if not self.api_key:
+            return {}
+        
+        prompt = self._build_prompt(text)
+        
         try:
-            from PyPDF2 import PdfReader
-            reader = PdfReader(file_path)
-            text = '\n'.join([p.extract_text() or '' for p in reader.pages])
-        except:
-            pass
+            import httpx
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                response = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": self.api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json"
+                    },
+                    json={
+                        "model": self.model,
+                        "max_tokens": 8000,
+                        "messages": [{"role": "user", "content": prompt}]
+                    }
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    content = result.get("content", [{}])[0].get("text", "")
+                    return self._parse_response(content)
+        except Exception as e:
+            print(f"AI Extraction error: {e}")
+        
+        return {}
     
-    return normalize_text(text)
-
-
-def extract_text_from_docx(file_path: str) -> str:
-    """Extract ALL text from DOCX: paragraphs + tables + text boxes."""
-    from docx import Document
-    doc = Document(file_path)
-    
-    all_text = []
-    
-    # 1. Paragraphs
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if text:
-            all_text.append(text)
-    
-    # 2. Tables
-    for table in doc.tables:
-        for row in table.rows:
-            row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-            if row_text:
-                all_text.append(' | '.join(row_text))
-    
-    # 3. Text boxes (for multi-column layouts)
-    try:
-        for txbx in doc.element.iter():
-            if txbx.tag.endswith('txbxContent'):
-                texts = [t.text for t in txbx.iter() if t.tag.endswith('}t') and t.text]
-                if texts:
-                    content = ' '.join(texts)
-                    if content not in all_text:
-                        all_text.append(content)
-    except:
-        pass
-    
-    return normalize_text('\n'.join(all_text))
-
-
-# ============================================================================
-# SIMPLE REGEX EXTRACTORS (High confidence only)
-# ============================================================================
-
-def extract_email(text: str) -> Optional[str]:
-    """Extract email with high confidence."""
-    match = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', text)
-    return match.group(1).lower() if match else None
-
-
-def extract_phone(text: str) -> Optional[str]:
-    """Extract phone number with various formats."""
-    patterns = [
-        r'(\+1\s*[-.]?\s*\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})',
-        r'(\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})',
-        r'(\+\d{1,3}[-.\s]?\d{3,4}[-.\s]?\d{3,4}[-.\s]?\d{3,4})',
-        r'(\d{10})',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            phone = re.sub(r'[^\d+\-() ]', '', match.group(1)).strip()
-            if len(re.sub(r'\D', '', phone)) >= 10:
-                return phone
-    return None
-
-
-def extract_linkedin(text: str) -> Optional[str]:
-    """Extract LinkedIn URL."""
-    patterns = [
-        r'linkedin\.com\s*/?\s*in\s*/?\s*([\w-]+)',
-        r'linkedin[:\s]+(?:www\.)?linkedin\.com\s*/in/([\w-]+)',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            username = match.group(1)
-            if username.lower() not in ['summary', 'profile', 'in']:
-                return f"www.linkedin.com/in/{username}"
-    return None
-
-
-# ============================================================================
-# AI PRIMARY EXTRACTION
-# ============================================================================
-
-AI_EXTRACTION_PROMPT = """You are an expert resume parser. Extract ALL information from this resume into structured JSON.
-
-CRITICAL INSTRUCTIONS:
-1. Extract EVERY job/position mentioned, regardless of format
-2. Calculate duration_months accurately: (end_year - start_year) * 12 + (end_month - start_month) + 1
-3. Extract ALL responsibilities/bullet points for each job
-4. Identify the professional title from the most recent role or summary
-5. Handle ANY date format (YYYY, MM/YYYY, Month YYYY, MonYY, etc.)
-6. For "Present", "Current", or ongoing roles, use end date: {today}
-7. Parse client/account information if mentioned (e.g., "Client: ABC Corp" or "UPS Account")
+    def _build_prompt(self, text: str) -> str:
+        return f"""You are an expert resume parser. Extract ALL information from this resume.
 
 RESUME TEXT:
-{resume_text}
+{text[:20000]}
 
-Return ONLY valid JSON (no markdown, no explanation, no code blocks) in this exact structure:
+Return ONLY valid JSON (no markdown, no explanation) with this EXACT structure:
 {{
-  "name": {{
-    "full": "Full Name",
-    "first": "First",
-    "middle": "Middle or null",
-    "last": "Last"
-  }},
-  "contact": {{
-    "email": "email@domain.com or null",
-    "phone": "phone number or null",
-    "linkedin": "linkedin url or null",
-    "location": "City, State/Country or null"
-  }},
-  "professional_title": "Most appropriate title based on experience and summary",
-  "summary": "Professional summary if present, or null",
-  "experience": [
-    {{
-      "employer": "Company Name (not client)",
-      "title": "Job Title",
-      "location": "City, State or null",
-      "start_date": "YYYY-MM",
-      "end_date": "YYYY-MM",
-      "duration_months": 24,
-      "is_current": false,
-      "client": "Client/Account name if mentioned, or null",
-      "responsibilities": [
-        "Responsibility 1",
-        "Responsibility 2"
-      ]
+    "name": {{
+        "full": "Full Name",
+        "first": "First",
+        "middle": "Middle or null",
+        "last": "Last"
+    }},
+    "contact": {{
+        "email": "email@example.com",
+        "phone": "+1234567890",
+        "linkedin": "linkedin.com/in/username or null",
+        "location": "City, State/Country"
+    }},
+    "title": "Current Professional Title (e.g., 'Senior Software Engineer', 'Project Manager')",
+    "summary": "Professional summary text",
+    "experience": [
+        {{
+            "employer": "Company Name",
+            "title": "Job Title",
+            "location": "City, State",
+            "start_date": "YYYY-MM",
+            "end_date": "YYYY-MM or Present",
+            "is_current": true/false,
+            "responsibilities": ["Responsibility 1", "Responsibility 2"],
+            "technologies": ["Tech1", "Tech2"]
+        }}
+    ],
+    "education": [
+        {{
+            "degree": "Degree Name",
+            "institution": "University Name",
+            "year": "YYYY",
+            "field": "Field of Study"
+        }}
+    ],
+    "certifications": ["Cert 1", "Cert 2"],
+    "skills": {{
+        "technical": ["Skill1", "Skill2"],
+        "tools": ["Tool1", "Tool2"],
+        "domains": ["Domain1", "Domain2"]
     }}
-  ],
-  "education": [
-    {{
-      "degree": "Full Degree Name (e.g., Master of Business Administration, Bachelor of Technology)",
-      "field": "Field of Study or null",
-      "institution": "University/College Name",
-      "year": "YYYY or null",
-      "location": "Location or null"
-    }}
-  ],
-  "certifications": [
-    "Certification 1 - Issuing Organization",
-    "Certification 2"
-  ],
-  "skills": {{
-    "technical": ["Python", "Java", "SQL"],
-    "tools": ["AWS", "Docker", "Kubernetes"],
-    "databases": ["PostgreSQL", "MongoDB"],
-    "frameworks": ["React", "Django"]
-  }}
 }}
 
-IMPORTANT RULES:
-- Sort experience by start_date descending (most recent first)
-- Include ALL jobs, even short-term or contract positions
-- Extract complete responsibilities, not truncated
-- For education without explicit year, extract from context if possible
-- Clean up any encoding artifacts in names/text
-- If month is not specified, use 01 for start dates and 12 for end dates
-"""
+RULES:
+1. Extract EVERY job - do not skip any
+2. For dates: convert any format to YYYY-MM (e.g., "Jan 2020" → "2020-01", "2020" → "2020-01")
+3. For "Present", "Current", "Till Date" → use "Present"
+4. Extract ALL responsibilities as separate items
+5. If information is missing, use null
+6. Return ONLY the JSON object, nothing else"""
+
+    def _parse_response(self, content: str) -> Dict:
+        """Parse AI response to extract JSON."""
+        try:
+            # Try to find JSON in response
+            json_match = re.search(r'\{[\s\S]*\}', content)
+            if json_match:
+                return json.loads(json_match.group())
+        except json.JSONDecodeError:
+            pass
+        return {}
 
 
-async def ai_extract_resume(text: str) -> Dict:
-    """Use Claude AI to extract all resume data."""
-    if not ANTHROPIC_API_KEY:
-        return {"error": "No API key configured"}
+# ============================================================================
+# AGENT 2: RULES AGENT (Pattern-Based Extraction)
+# ============================================================================
+
+class RulesAgent:
+    """Pattern-based extraction using regex rules."""
     
-    try:
-        import httpx
+    def extract(self, text: str) -> Dict:
+        """Extract resume data using regex patterns."""
+        return {
+            "name": self._extract_name(text),
+            "contact": self._extract_contact(text),
+            "title": self._extract_title(text),
+            "experience": self._extract_experience(text),
+            "education": self._extract_education(text),
+            "certifications": self._extract_certifications(text),
+            "skills": self._extract_skills(text)
+        }
+    
+    def _extract_name(self, text: str) -> Dict:
+        """Extract name from resume."""
+        lines = [l.strip() for l in text.split('\n') if l.strip()][:20]
         
-        today = datetime.now().strftime("%Y-%m")
-        prompt = AI_EXTRACTION_PROMPT.format(
-            today=today,
-            resume_text=text[:25000]  # Limit to avoid token issues
+        skip_patterns = [
+            'resume', 'cv', 'curriculum', 'summary', 'objective', 'professional',
+            'experience', 'education', 'skills', 'technical', 'contact'
+        ]
+        
+        for line in lines:
+            clean = re.sub(r'\s*(Contact|Phone|Email|Tel|Cell|Mobile)[:\s].*$', '', line, flags=re.IGNORECASE).strip()
+            clean = re.sub(r'[\|].*$', '', clean).strip()
+            clean = re.sub(r'\s*,.*$', '', clean).strip()
+            
+            if any(skip in clean.lower() for skip in skip_patterns):
+                continue
+            if re.match(r'^[\w.+-]+@[\w.-]+\.\w+$', clean):
+                continue
+            if re.match(r'^[\d\s\-+()]+$', clean):
+                continue
+            
+            parts = clean.split()
+            if 2 <= len(parts) <= 4 and all(p[0].isupper() for p in parts if p):
+                tech_terms = ['SQL', 'ETL', 'GCP', 'AWS', 'API', 'XML', 'JSON']
+                if not any(p in tech_terms for p in parts):
+                    return {
+                        "full": clean,
+                        "first": parts[0],
+                        "middle": ' '.join(parts[1:-1]) if len(parts) > 2 else None,
+                        "last": parts[-1]
+                    }
+        
+        return {"full": None, "first": None, "middle": None, "last": None}
+    
+    def _extract_contact(self, text: str) -> Dict:
+        """Extract contact information."""
+        contact = {"email": None, "phone": None, "linkedin": None, "location": None}
+        
+        # Email
+        email_match = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', text)
+        if email_match:
+            contact["email"] = email_match.group(1).lower()
+        
+        # Phone - multiple patterns
+        phone_patterns = [
+            r'(?:Mob|Phone|Tel|Mobile|Cell)[:\s]*(\+?[\d\s\-().]{10,})',
+            r'(\+1\s*\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})',
+            r'(\(\d{3}\)\s*\d{3}[-.\s]?\d{4})',
+            r'(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})',
+        ]
+        for pattern in phone_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                phone = re.sub(r'[^\d+\-() ]', '', match.group(1)).strip()
+                if len(re.sub(r'\D', '', phone)) >= 10:
+                    contact["phone"] = phone
+                    break
+        
+        # LinkedIn
+        linkedin_match = re.search(r'linkedin\.com/in/([\w-]+)', text, re.IGNORECASE)
+        if linkedin_match:
+            contact["linkedin"] = f"linkedin.com/in/{linkedin_match.group(1)}"
+        
+        # Location
+        loc_patterns = [
+            r'([\w\s]+),\s*(TX|CA|NY|PA|IL|OH|GA|NC|FL|WA|MA|India|USA|Karnataka|Maharashtra)',
+        ]
+        for pattern in loc_patterns:
+            match = re.search(pattern, text)
+            if match:
+                contact["location"] = f"{match.group(1).strip()}, {match.group(2)}"
+                break
+        
+        return contact
+    
+    def _extract_title(self, text: str) -> Optional[str]:
+        """Extract professional title."""
+        # From summary
+        summary_match = re.search(
+            r'(?:PROFESSIONAL\s+)?SUMMARY[:\s]*\n(.+?)(?:\n[A-Z]{2,}|\Z)',
+            text, re.IGNORECASE | re.DOTALL
         )
-        
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"
-                },
-                json={
-                    "model": "claude-sonnet-4-20250514",
-                    "max_tokens": 8000,
-                    "messages": [{"role": "user", "content": prompt}]
-                }
+        if summary_match:
+            summary = summary_match.group(1)
+            title_match = re.match(
+                r'^([\w\s/]+(?:Manager|Engineer|Developer|Analyst|Consultant|Architect|Lead|Director))\s+with\s+\d+',
+                summary.strip(), re.IGNORECASE
             )
-            
-            if response.status_code == 200:
-                result = response.json()
-                ai_text = result.get("content", [{}])[0].get("text", "")
-                
-                # Extract JSON from response (handle potential markdown)
-                ai_text = ai_text.strip()
-                if ai_text.startswith('```'):
-                    ai_text = re.sub(r'^```(?:json)?\n?', '', ai_text)
-                    ai_text = re.sub(r'\n?```$', '', ai_text)
-                
-                json_match = re.search(r'\{[\s\S]*\}', ai_text)
-                if json_match:
-                    return json.loads(json_match.group())
-                return {"error": "No JSON found in response"}
-            else:
-                return {"error": f"API returned {response.status_code}: {response.text[:200]}"}
-                
-    except json.JSONDecodeError as e:
-        return {"error": f"JSON parse error: {str(e)}"}
-    except Exception as e:
-        return {"error": str(e)}
-    
-    return {"error": "Unknown error"}
-
-
-# ============================================================================
-# QUALITY VALIDATION & SCORING
-# ============================================================================
-
-def validate_and_score(parsed: Dict, original_text: str) -> Tuple[Dict, int, List[str]]:
-    """Validate AI output and calculate quality score."""
-    issues = []
-    score = 100
-    
-    # Validate name
-    name = parsed.get("name", {})
-    if not name.get("full") or len(name.get("full", "")) < 3:
-        issues.append("missing_name")
-        score -= 20
-    
-    # Validate contact (email is critical)
-    contact = parsed.get("contact", {})
-    if not contact.get("email"):
-        # Try regex fallback
-        email = extract_email(original_text)
-        if email:
-            contact["email"] = email
-        else:
-            issues.append("missing_email")
-            score -= 15
-    
-    # Validate phone
-    if not contact.get("phone"):
-        phone = extract_phone(original_text)
-        if phone:
-            contact["phone"] = phone
-    
-    # Validate LinkedIn
-    if not contact.get("linkedin"):
-        linkedin = extract_linkedin(original_text)
-        if linkedin:
-            contact["linkedin"] = linkedin
-    
-    # Validate experience
-    experience = parsed.get("experience", [])
-    if not experience:
-        issues.append("missing_experience")
-        score -= 25
-    else:
-        total_resp = sum(len(e.get("responsibilities", [])) for e in experience)
-        if total_resp < 3:
-            issues.append("low_responsibilities")
-            score -= 10
+            if title_match:
+                return title_match.group(1).strip()
         
-        # Check and fix each experience entry
-        for i, exp in enumerate(experience):
-            if not exp.get("employer"):
-                issues.append(f"exp_{i}_missing_employer")
-                score -= 5
-            if not exp.get("title"):
-                issues.append(f"exp_{i}_missing_title")
-                score -= 5
-            
-            # Ensure duration is calculated
-            if not exp.get("duration_months") or exp.get("duration_months", 0) <= 0:
-                exp["duration_months"] = calculate_duration_from_dates(
-                    exp.get("start_date"), exp.get("end_date")
+        return None
+    
+    def _extract_experience(self, text: str) -> List[Dict]:
+        """Extract work experience using multiple strategies."""
+        experiences = []
+        
+        # Strategy 1: "Worked as X in Y from A to B"
+        worked_pattern = r'[Ww]ork(?:ed|ing)\s+(?:as\s+)?(?:a\s+)?(.+?)\s+in\s+(.+?)\s+from\s+(\w+\s+\d{4})\s+to\s+(\w+\s+\d{4}|Present|Current)'
+        for match in re.finditer(worked_pattern, text, re.IGNORECASE):
+            exp = self._build_experience(
+                title=match.group(1).strip(),
+                employer=match.group(2).strip(),
+                start_str=match.group(3),
+                end_str=match.group(4)
+            )
+            if exp:
+                experiences.append(exp)
+        
+        # Strategy 2: Date range detection
+        date_pattern = r'((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})\s*[-–]\s*((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|Present|Current|Till\s+Date)'
+        
+        lines = text.split('\n')
+        for i, line in enumerate(lines):
+            date_match = re.search(date_pattern, line, re.IGNORECASE)
+            if date_match:
+                employer, title, location = self._parse_experience_header(line, lines, i, date_match)
+                responsibilities = self._extract_responsibilities(lines, i + 1)
+                
+                exp = self._build_experience(
+                    title=title,
+                    employer=employer,
+                    location=location,
+                    start_str=date_match.group(1),
+                    end_str=date_match.group(2),
+                    responsibilities=responsibilities
                 )
-    
-    # Validate professional title
-    if not parsed.get("professional_title"):
-        if experience:
-            parsed["professional_title"] = experience[0].get("title", "Professional")
-        else:
-            issues.append("missing_title")
-            score -= 10
-    
-    # Validate education
-    education = parsed.get("education", [])
-    if not education:
-        issues.append("missing_education")
-        score -= 10
-    
-    # Calculate totals
-    total_months = sum(e.get("duration_months", 0) for e in experience)
-    parsed["total_experience_months"] = total_months
-    parsed["total_experience_years"] = round(total_months / 12, 1) if total_months else 0
-    
-    return parsed, max(0, score), issues
-
-
-def calculate_duration_from_dates(start: str, end: str) -> int:
-    """Calculate duration in months from date strings."""
-    if not start:
-        return 0
-    
-    try:
-        # Parse start date
-        start_parts = start.split('-')
-        start_year = int(start_parts[0])
-        start_month = int(start_parts[1]) if len(start_parts) > 1 else 1
+                if exp and not self._is_duplicate(exp, experiences):
+                    experiences.append(exp)
         
-        # Parse end date
-        if not end or end.lower() in ['present', 'current']:
+        # Strategy 3: Short date format (Jul24, Jun21)
+        short_date_pattern = r'(\w{3}\d{2})\s+to\s+(\w{3}\d{2}|Present|P)'
+        for i, line in enumerate(lines):
+            if 'Client:' in line:
+                match = re.search(short_date_pattern, line, re.IGNORECASE)
+                if match:
+                    employer_match = re.search(r'Client:\s*(.+?)[-–]', line)
+                    if employer_match:
+                        exp = self._build_experience(
+                            employer=employer_match.group(1).strip(),
+                            start_str=match.group(1),
+                            end_str=match.group(2),
+                            responsibilities=self._extract_responsibilities(lines, i + 1)
+                        )
+                        if exp and not self._is_duplicate(exp, experiences):
+                            experiences.append(exp)
+        
+        # Sort by start date descending
+        experiences.sort(key=lambda x: x.get('start_date', ''), reverse=True)
+        return experiences
+    
+    def _parse_experience_header(self, line: str, lines: List[str], idx: int, date_match) -> Tuple[str, str, str]:
+        """Parse experience header line."""
+        employer, title, location = "", "", ""
+        header = line[:date_match.start()].strip()
+        
+        # Pipe format: "Title | Date" with company on previous line
+        if '|' in line:
+            title = line.split('|')[0].strip()
+            if idx > 0:
+                prev = lines[idx - 1].strip()
+                loc_match = re.search(r'[-–]\s*(.+)$', prev)
+                if loc_match:
+                    employer = prev[:prev.find('-')].strip()
+                    location = loc_match.group(1).strip()
+                else:
+                    employer = prev
+        else:
+            # Standard: "Company – Title Location"
+            dash_match = re.match(r'^([A-Za-z][\w\s&.,()]+?)\s*[-–]\s*(.+)$', header)
+            if dash_match:
+                employer = dash_match.group(1).strip()
+                title = dash_match.group(2).strip()
+            else:
+                employer = header
+        
+        return employer, title, location
+    
+    def _extract_responsibilities(self, lines: List[str], start_idx: int) -> List[str]:
+        """Extract bullet points as responsibilities."""
+        responsibilities = []
+        date_pattern = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}\s*[-–]'
+        
+        for j in range(start_idx, min(start_idx + 25, len(lines))):
+            line = lines[j].strip()
+            
+            if re.search(date_pattern, line, re.IGNORECASE):
+                break
+            if re.match(r'^(EDUCATION|TECHNICAL|SKILLS|CERTIFICATIONS)', line, re.IGNORECASE):
+                break
+            
+            if line.startswith(('•', '-', '*', '–')) or re.match(r'^\d+\.', line):
+                resp = re.sub(r'^[•\-\*–\d.]\s*', '', line)
+                if len(resp) > 20:
+                    responsibilities.append(resp)
+        
+        return responsibilities[:12]
+    
+    def _build_experience(self, title: str = "", employer: str = "", location: str = "",
+                         start_str: str = "", end_str: str = "", 
+                         responsibilities: List[str] = None) -> Optional[Dict]:
+        """Build experience dictionary with calculated duration."""
+        if not employer and not title:
+            return None
+        
+        start_year, start_month = self._parse_date(start_str)
+        end_year, end_month, is_current = self._parse_date_with_current(end_str)
+        
+        if not start_year:
+            return None
+        
+        duration = self._calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
+        
+        return {
+            "employer": employer or "Unknown",
+            "title": title or "Professional",
+            "location": location,
+            "start_date": f"{start_year}-{(start_month or 1):02d}",
+            "end_date": "Present" if is_current else f"{end_year}-{(end_month or 12):02d}",
+            "is_current": is_current,
+            "duration_months": duration,
+            "responsibilities": responsibilities or [],
+            "technologies": []
+        }
+    
+    def _parse_date(self, text: str) -> Tuple[Optional[int], Optional[int]]:
+        """Parse date string to (year, month)."""
+        if not text:
+            return None, None
+        
+        text = text.strip().lower()
+        
+        # Month Year
+        match = re.search(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s*(\d{4})', text)
+        if match:
+            return int(match.group(2)), MONTH_MAP.get(match.group(1)[:3])
+        
+        # Short format: Jul24
+        match = re.match(r'(\w{3})(\d{2})$', text)
+        if match:
+            month = MONTH_MAP.get(match.group(1)[:3].lower())
+            year = 2000 + int(match.group(2)) if int(match.group(2)) < 50 else 1900 + int(match.group(2))
+            return year, month
+        
+        # Just year
+        match = re.search(r'\b(19\d{2}|20\d{2})\b', text)
+        if match:
+            return int(match.group(1)), None
+        
+        return None, None
+    
+    def _parse_date_with_current(self, text: str) -> Tuple[Optional[int], Optional[int], bool]:
+        """Parse date with current/present detection."""
+        if not text:
+            return None, None, False
+        
+        text_lower = text.lower().strip()
+        if any(p in text_lower for p in ['present', 'current', 'now', 'till date', 'p']):
+            now = datetime.now()
+            return now.year, now.month, True
+        
+        year, month = self._parse_date(text)
+        return year, month, False
+    
+    def _calculate_duration(self, start_year: int, start_month: int, 
+                           end_year: int, end_month: int) -> int:
+        """Calculate duration in months."""
+        if not end_year:
             end_year = datetime.now().year
             end_month = datetime.now().month
+        
+        start_dt = datetime(start_year, start_month, 1)
+        end_dt = datetime(end_year, end_month, 1)
+        delta = relativedelta(end_dt, start_dt)
+        return max(1, delta.years * 12 + delta.months + 1)
+    
+    def _is_duplicate(self, exp: Dict, existing: List[Dict]) -> bool:
+        """Check if experience is duplicate."""
+        for e in existing:
+            if e.get('employer') == exp.get('employer') and e.get('start_date') == exp.get('start_date'):
+                return True
+        return False
+    
+    def _extract_education(self, text: str) -> List[Dict]:
+        """Extract education information."""
+        education = []
+        
+        edu_match = re.search(
+            r'(?:EDUCATION(?:AL)?|ACADEMIC)[:\s]*\n?(.+?)(?:\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nSKILLS|\nEXPERIENCE|\Z)',
+            text, re.IGNORECASE | re.DOTALL
+        )
+        
+        if edu_match:
+            section = edu_match.group(1)
+            
+            # Pattern: "Degree | Institution | Year"
+            for match in re.finditer(r'([^|\n]+)\s*\|\s*([^|\n]+)\s*\|\s*.*?(\d{4})', section):
+                education.append({
+                    "degree": match.group(1).strip(),
+                    "institution": match.group(2).strip(),
+                    "year": match.group(3),
+                    "field": None
+                })
+            
+            # Pattern: "Degree – Institution | Year"
+            for match in re.finditer(r'([^–\n]+)\s*–\s*([^|\n]+)\s*\|\s*.*?(\d{4})', section):
+                if not any(e['degree'] == match.group(1).strip() for e in education):
+                    education.append({
+                        "degree": match.group(1).strip(),
+                        "institution": match.group(2).strip(),
+                        "year": match.group(3),
+                        "field": None
+                    })
+            
+            # Pattern: "Degree from Institution Year"
+            for match in re.finditer(r'((?:Master|Bachelor|MBA|MCA|B\.?Tech|M\.?Tech)[^,\n]+?)\s+(?:from|at)\s+([^,\n]+?)\s+(\d{4})', section, re.IGNORECASE):
+                if not any(e['degree'] == match.group(1).strip() for e in education):
+                    education.append({
+                        "degree": match.group(1).strip(),
+                        "institution": match.group(2).strip(),
+                        "year": match.group(3),
+                        "field": None
+                    })
+        
+        return education
+    
+    def _extract_certifications(self, text: str) -> List[str]:
+        """Extract certifications."""
+        certs = []
+        
+        cert_match = re.search(
+            r'CERTIFICATIONS?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nEDUCATION|\Z)',
+            text, re.IGNORECASE | re.DOTALL
+        )
+        
+        if cert_match:
+            section = cert_match.group(1)
+            for line in section.split('\n'):
+                line = re.sub(r'^[•·\-\*]\s*', '', line.strip())
+                if line and 3 < len(line) < 200:
+                    if not re.match(r'^(PROFESSIONAL|EXPERIENCE|IBM|Cognizant)', line, re.IGNORECASE):
+                        certs.append(line)
+        
+        return certs[:15]
+    
+    def _extract_skills(self, text: str) -> Dict:
+        """Extract technical skills."""
+        skills = {"technical": [], "tools": [], "domains": []}
+        
+        # Common skill keywords
+        tech_skills = ['python', 'java', 'javascript', 'sql', 'c++', 'c#', 'go', 'rust', 'scala', 'kotlin']
+        tools = ['aws', 'azure', 'gcp', 'docker', 'kubernetes', 'jenkins', 'git', 'jira', 'terraform', 'ansible']
+        domains = ['banking', 'finance', 'healthcare', 'retail', 'telecom', 'insurance']
+        
+        text_lower = text.lower()
+        
+        for skill in tech_skills:
+            if re.search(rf'\b{skill}\b', text_lower):
+                skills["technical"].append(skill.title() if len(skill) > 3 else skill.upper())
+        
+        for tool in tools:
+            if re.search(rf'\b{tool}\b', text_lower):
+                skills["tools"].append(tool.upper() if len(tool) <= 3 else tool.title())
+        
+        for domain in domains:
+            if re.search(rf'\b{domain}\b', text_lower):
+                skills["domains"].append(domain.title())
+        
+        return skills
+
+
+# ============================================================================
+# AGENT 3: VALIDATION AGENT
+# ============================================================================
+
+class ValidationAgent:
+    """Validates and scores parsed resume data."""
+    
+    def validate(self, parsed: Dict, original_text: str) -> Tuple[int, List[str], Dict]:
+        """Validate parsed data and return score, issues, and fixes."""
+        score = 100
+        issues = []
+        fixes = {}
+        
+        # Check name
+        name = parsed.get("name", {})
+        if not name.get("full") or len(name.get("full", "")) < 3:
+            score -= 20
+            issues.append("missing_name")
+        
+        # Check contact
+        contact = parsed.get("contact", {})
+        if not contact.get("email"):
+            score -= 15
+            issues.append("missing_email")
+            # Try to fix
+            email_match = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', original_text)
+            if email_match:
+                fixes["email"] = email_match.group(1).lower()
+        
+        if not contact.get("phone"):
+            score -= 10
+            issues.append("missing_phone")
+        
+        # Check experience
+        experience = parsed.get("experience", [])
+        if len(experience) == 0:
+            score -= 25
+            issues.append("missing_experience")
         else:
-            end_parts = end.split('-')
-            end_year = int(end_parts[0])
-            end_month = int(end_parts[1]) if len(end_parts) > 1 else 12
+            total_resp = sum(len(e.get("responsibilities", [])) for e in experience)
+            if total_resp < 5:
+                score -= 10
+                issues.append("low_responsibilities")
+            
+            for i, exp in enumerate(experience):
+                if not exp.get("title"):
+                    score -= 5
+                    issues.append(f"exp_{i}_missing_title")
+                if not exp.get("employer"):
+                    score -= 5
+                    issues.append(f"exp_{i}_missing_employer")
         
-        # Calculate duration
-        months = (end_year - start_year) * 12 + (end_month - start_month) + 1
-        return max(1, months)
-    except:
-        return 0
+        # Check education
+        if len(parsed.get("education", [])) == 0:
+            score -= 10
+            issues.append("missing_education")
+        
+        # Check title
+        if not parsed.get("title"):
+            score -= 5
+            issues.append("missing_title")
+            # Try to derive from experience
+            if experience and experience[0].get("title"):
+                fixes["title"] = experience[0]["title"]
+        
+        return max(0, score), issues, fixes
 
 
 # ============================================================================
-# OUTPUT FORMATTING
+# AGENT 4: ENHANCEMENT AGENT
 # ============================================================================
 
-def format_output(parsed: Dict) -> Dict:
-    """Format parsed data into final output structure."""
-    name = parsed.get("name", {})
-    contact = parsed.get("contact", {})
+class EnhancementAgent:
+    """Enhances and normalizes parsed data."""
     
-    # Build experience list
-    experience_list = []
-    for exp in parsed.get("experience", []):
-        experience_list.append({
-            "Employer": exp.get("employer"),
-            "title": exp.get("title"),
-            "location": exp.get("location"),
-            "start_date": exp.get("start_date"),
-            "end_date": exp.get("end_date"),
-            "duration_months": exp.get("duration_months", 0),
-            "responsibilities": exp.get("responsibilities", []),
-            "tools": [],
-            "client": exp.get("client")
-        })
-    
-    # Build education list
-    education_list = []
-    for edu in parsed.get("education", []):
-        degree = edu.get("degree", "")
-        if edu.get("field") and edu.get("field") not in str(degree):
-            degree = f"{degree} in {edu['field']}" if degree else edu['field']
+    def enhance(self, parsed: Dict, fixes: Dict) -> Dict:
+        """Apply fixes and enhancements."""
+        # Apply validation fixes
+        if fixes.get("email"):
+            if "contact" not in parsed:
+                parsed["contact"] = {}
+            parsed["contact"]["email"] = fixes["email"]
         
-        education_list.append({
-            "degree": degree or None,
-            "institution": edu.get("institution"),
-            "year": edu.get("year")
-        })
+        if fixes.get("title"):
+            parsed["title"] = fixes["title"]
+        
+        # Calculate totals
+        experience = parsed.get("experience", [])
+        total_months = sum(e.get("duration_months", 0) for e in experience)
+        parsed["total_experience_months"] = total_months
+        parsed["total_experience_years"] = round(total_months / 12, 1)
+        
+        # Build full name if missing
+        name = parsed.get("name", {})
+        if not name.get("full") and (name.get("first") or name.get("last")):
+            parts = [name.get("first"), name.get("middle"), name.get("last")]
+            name["full"] = ' '.join(filter(None, parts))
+            parsed["name"] = name
+        
+        return parsed
+
+
+# ============================================================================
+# MASTER ORCHESTRATOR
+# ============================================================================
+
+class ResumeParserOrchestrator:
+    """Orchestrates all agents for complete resume parsing."""
     
-    # Build skills list
-    skills = parsed.get("skills", {})
-    technical_skills = []
-    for category in ['technical', 'tools', 'databases', 'frameworks', 'languages']:
-        technical_skills.extend(skills.get(category, []))
+    def __init__(self, api_key: str = ""):
+        self.extraction_agent = ExtractionAgent(api_key) if api_key else None
+        self.rules_agent = RulesAgent()
+        self.validation_agent = ValidationAgent()
+        self.enhancement_agent = EnhancementAgent()
+        self.api_key = api_key
     
-    return {
-        "parsed_resume": {
+    async def parse(self, text: str, filename: str = "") -> Dict:
+        """Parse resume using multi-agent system."""
+        
+        # Step 1: Try AI extraction first (if available)
+        ai_result = {}
+        if self.extraction_agent:
+            ai_result = await self.extraction_agent.extract(text)
+        
+        # Step 2: Rules-based extraction (always run as backup)
+        rules_result = self.rules_agent.extract(text)
+        
+        # Step 3: Merge results (AI takes priority where available)
+        merged = self._merge_results(ai_result, rules_result)
+        
+        # Step 4: Validate
+        score, issues, fixes = self.validation_agent.validate(merged, text)
+        
+        # Step 5: Enhance
+        enhanced = self.enhancement_agent.enhance(merged, fixes)
+        
+        # Build final output
+        return {
+            "parsed_resume": self._format_output(enhanced, filename),
+            "validation_score": score,
+            "validation_issues": issues,
+            "extraction_method": "ai+rules" if ai_result else "rules_only"
+        }
+    
+    def _merge_results(self, ai: Dict, rules: Dict) -> Dict:
+        """Merge AI and rules results, preferring AI where valid."""
+        if not ai:
+            return rules
+        
+        merged = {}
+        
+        # Name: prefer AI if complete
+        ai_name = ai.get("name", {})
+        rules_name = rules.get("name", {})
+        if ai_name.get("full") and len(ai_name.get("full", "")) > 3:
+            merged["name"] = ai_name
+        else:
+            merged["name"] = rules_name
+        
+        # Contact: merge both
+        merged["contact"] = {**rules.get("contact", {}), **ai.get("contact", {})}
+        
+        # Title: prefer AI
+        merged["title"] = ai.get("title") or rules.get("title")
+        
+        # Experience: prefer AI if more complete
+        ai_exp = ai.get("experience", [])
+        rules_exp = rules.get("experience", [])
+        
+        ai_resp_count = sum(len(e.get("responsibilities", [])) for e in ai_exp)
+        rules_resp_count = sum(len(e.get("responsibilities", [])) for e in rules_exp)
+        
+        if len(ai_exp) >= len(rules_exp) and ai_resp_count >= rules_resp_count:
+            merged["experience"] = ai_exp
+        else:
+            merged["experience"] = rules_exp
+        
+        # Education: prefer AI if present
+        merged["education"] = ai.get("education") or rules.get("education", [])
+        
+        # Certifications
+        merged["certifications"] = ai.get("certifications") or rules.get("certifications", [])
+        
+        # Skills
+        merged["skills"] = ai.get("skills") or rules.get("skills", {})
+        
+        return merged
+    
+    def _format_output(self, data: Dict, filename: str) -> Dict:
+        """Format output to standard structure."""
+        name = data.get("name", {})
+        contact = data.get("contact", {})
+        
+        return {
             "firstname": name.get("first"),
             "lastname": name.get("last"),
             "name": name.get("full"),
-            "title": parsed.get("professional_title"),
+            "title": data.get("title"),
             "location": contact.get("location"),
             "phone_number": contact.get("phone"),
             "email": contact.get("email"),
             "linkedin": contact.get("linkedin"),
-            "summary": parsed.get("summary"),
-            "total_experience_months": parsed.get("total_experience_months", 0),
-            "total_experience_years": parsed.get("total_experience_years", 0),
-            "technical_skills": list(set(technical_skills)),
-            "education": education_list,
-            "certifications": parsed.get("certifications", []),
-            "experience": experience_list
+            "summary": data.get("summary"),
+            "total_experience_months": data.get("total_experience_months", 0),
+            "total_experience_years": data.get("total_experience_years", 0),
+            "experience": [
+                {
+                    "Employer": e.get("employer"),
+                    "title": e.get("title"),
+                    "location": e.get("location"),
+                    "start_date": e.get("start_date"),
+                    "end_date": e.get("end_date"),
+                    "duration_months": e.get("duration_months", 0),
+                    "responsibilities": e.get("responsibilities", []),
+                    "tools": e.get("technologies", [])
+                }
+                for e in data.get("experience", [])
+            ],
+            "education": data.get("education", []),
+            "certifications": data.get("certifications", []),
+            "technical_skills": (
+                data.get("skills", {}).get("technical", []) +
+                data.get("skills", {}).get("tools", [])
+            ),
+            "filename": filename
         }
-    }
 
 
 # ============================================================================
-# MAIN PARSING FUNCTION
+# PUBLIC API
 # ============================================================================
 
-async def parse_resume_intelligent(
-    text: str,
-    filename: str = "",
-    file_path: str = None
-) -> str:
+async def parse_resume_intelligent(text: str, filename: str = "", api_key: str = "") -> Dict:
     """
-    Intelligent resume parser using AI-first approach.
+    Parse resume using intelligent multi-agent system.
     
     Args:
         text: Resume text content
         filename: Original filename
-        file_path: Path to file for enhanced extraction
+        api_key: Anthropic API key for AI extraction
     
     Returns:
-        JSON string with parsed resume data
+        Parsed resume dictionary
     """
-    # Normalize text
-    text = normalize_text(text)
-    
-    # If file path provided, try enhanced extraction
-    if file_path:
-        if file_path.endswith('.pdf'):
-            enhanced_text = extract_text_from_pdf(file_path)
-            if len(enhanced_text) > len(text):
-                text = enhanced_text
-        elif file_path.endswith('.docx'):
-            enhanced_text = extract_text_from_docx(file_path)
-            if len(enhanced_text) > len(text):
-                text = enhanced_text
-    
-    # Step 1: AI Primary Extraction
-    ai_result = await ai_extract_resume(text)
-    
-    if "error" in ai_result:
-        # AI failed - return error with basic regex extraction
-        return json.dumps({
-            "parsed_resume": {
-                "name": None,
-                "email": extract_email(text),
-                "phone_number": extract_phone(text),
-                "linkedin": extract_linkedin(text),
-                "experience": [],
-                "education": [],
-                "filename": filename
-            },
-            "ai_error": ai_result["error"],
-            "validation_score": 0,
-            "validation_issues": ["ai_extraction_failed"]
-        }, indent=2)
-    
-    # Step 2: Validate and Score
-    validated, score, issues = validate_and_score(ai_result, text)
-    
-    # Step 3: Format Output
-    output = format_output(validated)
-    output["parsed_resume"]["filename"] = filename
-    output["validation_score"] = score
-    output["validation_issues"] = issues
-    output["ai_enhanced"] = True
-    
-    return json.dumps(output, indent=2, ensure_ascii=False)
+    orchestrator = ResumeParserOrchestrator(api_key)
+    return await orchestrator.parse(text, filename)
 
 
-# ============================================================================
-# BACKWARD COMPATIBLE INTERFACE
-# ============================================================================
-
-# Pydantic models for compatibility
-try:
-    from pydantic import BaseModel, Field, ConfigDict
-    from enum import Enum
-    
-    class ResponseFormat(str, Enum):
-        MARKDOWN = "markdown"
-        JSON = "json"
-    
-    class ParseResumeInput(BaseModel):
-        model_config = ConfigDict(str_strip_whitespace=True)
-        resume_text: str = Field(..., min_length=50, max_length=100000)
-        response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
-        filename: Optional[str] = Field(default=None)
-        file_path: Optional[str] = Field(default=None)
-        use_ai_validation: bool = Field(default=True)
-
-except ImportError:
-    pass
-
-
+# For backward compatibility
 async def parse_resume_full(params) -> str:
-    """Backward compatible interface for existing code."""
-    return await parse_resume_intelligent(
+    """Backward compatible wrapper."""
+    result = await parse_resume_intelligent(
         text=params.resume_text,
         filename=params.filename or "",
-        file_path=params.file_path
+        api_key=""
     )
-
-
-# ============================================================================
-# CLI TESTING
-# ============================================================================
-
-if __name__ == "__main__":
-    import sys
-    
-    async def test_file(path: str):
-        if path.endswith('.pdf'):
-            text = extract_text_from_pdf(path)
-        elif path.endswith('.docx'):
-            text = extract_text_from_docx(path)
-        else:
-            with open(path, 'r') as f:
-                text = f.read()
-        
-        result = await parse_resume_intelligent(text, path.split('/')[-1], path)
-        print(result)
-    
-    if len(sys.argv) > 1:
-        asyncio.run(test_file(sys.argv[1]))
-    else:
-        print("Usage: python intelligent_parser.py <resume_file>")
- 
+    return json.dumps(result, indent=2, ensure_ascii=False)
