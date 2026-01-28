@@ -1,59 +1,95 @@
 """
-Resume Parser API Server v4.0
-=============================
-Production-ready FastAPI server using proven multi-format parser.
-
-Endpoints:
-- GET / - API info
-- GET /health - Health check
-- GET /docs - Swagger UI
-- POST /parse/file - Parse uploaded resume
-- POST /parse/text - Parse resume text
+Resume Parser API Server
+========================
+FastAPI server for resume parsing with Swagger UI.
+Enhanced with comprehensive logging for Railway deployment.
 """
 
 import os
-import io
-import json
-import asyncio
-import re
+import sys
+import logging
+import traceback
 from typing import Optional
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Import proven parser
-from resume_parser_mcp import (
-    parse_resume_full, 
-    ParseResumeInput, 
-    normalize_text,
-    extract_text_from_docx_with_tables,
-    extract_all_text_from_docx,
-    ANTHROPIC_API_KEY
+# ============================================================================
+# LOGGING CONFIGURATION - Must be first
+# ============================================================================
+
+# Force stdout to be unbuffered for Railway
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
 )
+
+logger = logging.getLogger("resume_parser_api")
+logger.setLevel(logging.DEBUG)
+
+# Log startup
+logger.info("=" * 60)
+logger.info("RESUME PARSER API - STARTING")
+logger.info("=" * 60)
+logger.info(f"Python version: {sys.version}")
+logger.info(f"Working directory: {os.getcwd()}")
+logger.info(f"PORT env: {os.environ.get('PORT', 'not set')}")
+logger.info(f"ANTHROPIC_API_KEY set: {bool(os.environ.get('ANTHROPIC_API_KEY'))}")
+
+# ============================================================================
+# IMPORT PARSER MODULE
+# ============================================================================
+
+try:
+    logger.info("Importing resume_parser_mcp module...")
+    from resume_parser_mcp import (
+        parse_resume_full, ParseResumeInput, ResponseFormat,
+        extract_technical_skills, normalize_text, ANTHROPIC_API_KEY
+    )
+    logger.info("Successfully imported resume_parser_mcp")
+except ImportError as e:
+    logger.error(f"Failed to import resume_parser_mcp: {e}")
+    logger.error(traceback.format_exc())
+    raise
+except Exception as e:
+    logger.error(f"Unexpected error importing resume_parser_mcp: {e}")
+    logger.error(traceback.format_exc())
+    raise
+
+# ============================================================================
+# FASTAPI APP
+# ============================================================================
+
+logger.info("Creating FastAPI app...")
 
 app = FastAPI(
     title="Resume Parser API",
     description="""
-## Enterprise Resume Parser v4.0
+## Production-Grade Resume Parser with AI Validation
 
-### Architecture:
-- **Multi-Strategy Extraction**: 12+ pattern-based strategies
-- **AI Enhancement**: Claude API for complex cases
-- **Validation Agent**: Quality scoring & completeness checks
+### Features:
+- Multi-format: PDF, DOCX, TXT
+- Intelligent extraction: Name, contact, education, experience, skills
+- Skill categorization with experience months
+- Optional Claude AI validation
 
-### Supported Formats:
-- PDF (pdfplumber + PyPDF2 fallback)
-- DOCX (paragraphs + tables + text boxes)
-- TXT
+### Configuration:
+Set `ANTHROPIC_API_KEY` environment variable for AI enhancement.
 
-### Key Features:
-- Handles pipe, dash, table, worked-as formats
-- Text box extraction for sidebar layouts
-- Table extraction for structured resumes
-- Automatic duration calculation
-- Skill-to-experience mapping
+### Endpoints:
+- `GET /` - API info
+- `GET /health` - Health check
+- `POST /parse/file` - Parse uploaded file
+- `POST /parse` - Parse text
+- `POST /extract/skills` - Extract skills from text
     """,
-    version="4.0.0",
+    version="2.0.0",
     docs_url="/docs"
 )
 
@@ -65,206 +101,229 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+logger.info("FastAPI app created successfully")
 
-# =============================================================================
-# MODELS
-# =============================================================================
+# ============================================================================
+# REQUEST MODELS
+# ============================================================================
 
 class ParseTextRequest(BaseModel):
-    text: str = Field(..., min_length=50, description="Resume text content")
-    use_ai: bool = Field(default=True, description="Enable AI validation")
-    filename: Optional[str] = Field(default=None, description="Original filename")
+    text: str = Field(..., min_length=50)
+    use_ai_validation: bool = Field(default=True)
+    filename: Optional[str] = Field(default=None)
 
 
-class HealthResponse(BaseModel):
-    status: str
-    ai_available: bool
-    version: str
+class ExtractSkillsRequest(BaseModel):
+    text: str = Field(..., min_length=10)
 
 
-# =============================================================================
-# TEXT EXTRACTION
-# =============================================================================
+# ============================================================================
+# STARTUP/SHUTDOWN EVENTS
+# ============================================================================
 
-def extract_text_from_pdf(content: bytes) -> str:
-    """Extract text from PDF using pdfplumber with PyPDF2 fallback."""
-    text = ""
-    
-    # Try pdfplumber first
-    try:
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(content)) as pdf:
-            text = '\n'.join([page.extract_text() or '' for page in pdf.pages])
-            if text.strip():
-                return text
-    except Exception:
-        pass
-    
-    # Fallback to PyPDF2
-    try:
-        from PyPDF2 import PdfReader
-        reader = PdfReader(io.BytesIO(content))
-        text = '\n'.join([page.extract_text() or '' for page in reader.pages])
-    except Exception as e:
-        raise HTTPException(500, f"PDF extraction failed: {str(e)}")
-    
-    return text
+@app.on_event("startup")
+async def startup_event():
+    logger.info("=" * 60)
+    logger.info("APPLICATION STARTUP COMPLETE")
+    logger.info("=" * 60)
+    logger.info(f"AI Validation: {'ENABLED' if ANTHROPIC_API_KEY else 'DISABLED'}")
+    logger.info("Ready to accept requests")
 
 
-def extract_text_from_docx(content: bytes, save_path: str = None) -> str:
-    """Extract text from DOCX including tables and text boxes."""
-    from docx import Document
-    
-    doc = Document(io.BytesIO(content))
-    all_text = []
-    
-    # 1. Extract paragraphs
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if text:
-            all_text.append(text)
-    
-    # 2. Extract tables
-    for table in doc.tables:
-        for row in table.rows:
-            row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-            if row_text:
-                all_text.append(' | '.join(row_text))
-    
-    # 3. Extract text boxes (for sidebar/multi-column layouts)
-    try:
-        xml_str = doc.element.xml
-        pattern = r'<w:txbxContent[^>]*>(.*?)</w:txbxContent>'
-        for match in re.findall(pattern, xml_str, re.DOTALL):
-            text_pattern = r'<w:t[^>]*>([^<]+)</w:t>'
-            texts = re.findall(text_pattern, match)
-            if texts:
-                combined = ' '.join(texts)
-                if combined.strip() and len(combined) > 5:
-                    all_text.append(combined)
-    except Exception:
-        pass
-    
-    return '\n'.join(all_text)
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Application shutting down...")
 
 
-# =============================================================================
+# ============================================================================
 # ENDPOINTS
-# =============================================================================
+# ============================================================================
 
 @app.get("/", tags=["Info"])
 async def root():
-    """API information."""
+    logger.info("GET / - Root endpoint called")
     return {
         "name": "Resume Parser API",
-        "version": "4.0.0",
-        "features": [
-            "Multi-format support (PDF, DOCX, TXT)",
-            "12+ extraction patterns",
-            "AI enhancement (optional)",
-            "Table & text box extraction",
-            "Validation scoring"
-        ],
-        "ai_enabled": bool(ANTHROPIC_API_KEY),
-        "docs": "/docs"
+        "version": "2.0.0",
+        "docs": "/docs",
+        "health": "/health",
+        "ai_validation": "enabled" if ANTHROPIC_API_KEY else "disabled"
     }
 
 
-@app.get("/health", response_model=HealthResponse, tags=["Health"])
+@app.get("/health", tags=["Health"])
 async def health_check():
-    """Health check endpoint."""
+    logger.info("GET /health - Health check called")
     return {
         "status": "healthy",
         "ai_available": bool(ANTHROPIC_API_KEY),
-        "version": "4.0.0"
+        "version": "2.0.0"
     }
 
 
 @app.post("/parse/file", tags=["Parsing"])
 async def parse_file(
-    file: UploadFile = File(..., description="Resume file (PDF, DOCX, TXT)"),
-    use_ai: bool = Form(default=True, description="Enable AI validation")
+    file: UploadFile = File(...),
+    use_ai_validation: bool = Form(default=True)
 ):
-    """
-    Parse resume from uploaded file.
+    """Parse resume from PDF/Word file."""
+    logger.info(f"POST /parse/file - Received file: {file.filename}")
+    logger.info(f"  Content-Type: {file.content_type}")
+    logger.info(f"  AI Validation: {use_ai_validation}")
     
-    Supports: PDF, DOCX, DOC, TXT
-    
-    Returns structured data including:
-    - Contact info (name, email, phone, linkedin)
-    - Work experience with responsibilities
-    - Education history
-    - Certifications
-    - Technical skills with experience mapping
-    """
     if not file.filename:
+        logger.warning("No filename provided")
         raise HTTPException(400, "No file provided")
     
     ext = file.filename.lower().split('.')[-1]
+    logger.info(f"  Extension: {ext}")
+    
     if ext not in ['pdf', 'docx', 'doc', 'txt']:
-        raise HTTPException(400, f"Unsupported format: {ext}. Use PDF, DOCX, or TXT")
+        logger.warning(f"Unsupported file extension: {ext}")
+        raise HTTPException(400, f"Unsupported file type: {ext}")
     
     try:
         content = await file.read()
+        logger.info(f"  File size: {len(content)} bytes")
         
         # Extract text based on file type
         if ext == 'pdf':
-            text = extract_text_from_pdf(content)
+            logger.info("  Extracting text from PDF...")
+            text = extract_pdf(content)
         elif ext in ['docx', 'doc']:
-            text = extract_text_from_docx(content)
+            logger.info("  Extracting text from DOCX...")
+            text = extract_docx(content)
         else:
+            logger.info("  Reading as plain text...")
             text = content.decode('utf-8', errors='ignore')
         
+        logger.info(f"  Extracted text length: {len(text)} chars")
+        
         if len(text.strip()) < 50:
+            logger.warning(f"Insufficient text extracted: {len(text.strip())} chars")
             raise HTTPException(400, "Insufficient text extracted from file")
         
-        # Parse using proven multi-strategy parser
+        # Parse resume
+        logger.info("  Parsing resume...")
         result = await parse_resume_full(ParseResumeInput(
             resume_text=text,
             filename=file.filename,
-            use_ai_validation=use_ai and bool(ANTHROPIC_API_KEY)
+            use_ai_validation=use_ai_validation
         ))
         
+        logger.info("  Parse complete, returning JSON")
+        import json
         return json.loads(result)
-        
+    
     except HTTPException:
         raise
-    except json.JSONDecodeError as e:
-        raise HTTPException(500, f"JSON parsing error: {str(e)}")
     except Exception as e:
-        raise HTTPException(500, f"Parsing error: {str(e)}")
+        logger.error(f"Error parsing file: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(500, f"Error parsing file: {str(e)}")
 
 
-@app.post("/parse/text", tags=["Parsing"])
+@app.post("/parse", tags=["Parsing"])
 async def parse_text(request: ParseTextRequest):
-    """
-    Parse resume from raw text.
+    """Parse resume from text."""
+    logger.info(f"POST /parse - Received text ({len(request.text)} chars)")
+    logger.info(f"  AI Validation: {request.use_ai_validation}")
+    logger.info(f"  Filename: {request.filename}")
     
-    Useful for:
-    - Text already extracted from documents
-    - Copy-pasted resume content
-    - Testing and debugging
-    """
     try:
+        logger.info("  Parsing resume...")
         result = await parse_resume_full(ParseResumeInput(
             resume_text=request.text,
-            filename=request.filename or "text_input",
-            use_ai_validation=request.use_ai and bool(ANTHROPIC_API_KEY)
+            filename=request.filename,
+            use_ai_validation=request.use_ai_validation
         ))
         
+        logger.info("  Parse complete, returning JSON")
+        import json
         return json.loads(result)
-        
-    except json.JSONDecodeError as e:
-        raise HTTPException(500, f"JSON parsing error: {str(e)}")
     except Exception as e:
-        raise HTTPException(500, f"Parsing error: {str(e)}")
+        logger.error(f"Error parsing text: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(500, f"Error parsing text: {str(e)}")
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
+@app.post("/extract/skills", tags=["Utilities"])
+async def extract_skills(request: ExtractSkillsRequest):
+    """Extract technical skills from text."""
+    logger.info(f"POST /extract/skills - Received text ({len(request.text)} chars)")
+    
+    try:
+        skills = extract_technical_skills(request.text)
+        logger.info(f"  Extracted {len(skills)} skills")
+        return {"skills": skills, "count": len(skills)}
+    except Exception as e:
+        logger.error(f"Error extracting skills: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(500, f"Error extracting skills: {str(e)}")
+
+
+# ============================================================================
+# FILE EXTRACTION HELPERS
+# ============================================================================
+
+def extract_pdf(content: bytes) -> str:
+    """Extract text from PDF bytes."""
+    logger.debug("extract_pdf called")
+    try:
+        import pdfplumber
+        import io
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            pages_text = []
+            for i, page in enumerate(pdf.pages):
+                page_text = page.extract_text() or ''
+                pages_text.append(page_text)
+                logger.debug(f"  PDF page {i+1}: {len(page_text)} chars")
+            return '\n'.join(pages_text)
+    except ImportError:
+        logger.warning("pdfplumber not available, trying PyPDF2")
+        from PyPDF2 import PdfReader
+        import io
+        reader = PdfReader(io.BytesIO(content))
+        pages_text = []
+        for i, page in enumerate(reader.pages):
+            page_text = page.extract_text() or ''
+            pages_text.append(page_text)
+            logger.debug(f"  PDF page {i+1}: {len(page_text)} chars")
+        return '\n'.join(pages_text)
+
+
+def extract_docx(content: bytes) -> str:
+    """Extract text from DOCX bytes."""
+    logger.debug("extract_docx called")
+    from docx import Document
+    import io
+    doc = Document(io.BytesIO(content))
+    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    logger.debug(f"  Extracted {len(paragraphs)} paragraphs")
+    return '\n'.join(paragraphs)
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
     import uvicorn
+    
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    host = "0.0.0.0"
+    
+    logger.info("=" * 60)
+    logger.info(f"STARTING UVICORN SERVER")
+    logger.info(f"  Host: {host}")
+    logger.info(f"  Port: {port}")
+    logger.info("=" * 60)
+    
+    # Run with detailed logging
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        access_log=True
+    )
