@@ -1,35 +1,59 @@
 """
-Resume Parser API Server v3.2
+Resume Parser API Server v4.0
 =============================
-FastAPI server with intelligent AI-first parsing + regex fallback.
+Production-ready FastAPI server using proven multi-format parser.
+
+Endpoints:
+- GET / - API info
+- GET /health - Health check
+- GET /docs - Swagger UI
+- POST /parse/file - Parse uploaded resume
+- POST /parse/text - Parse resume text
 """
 
 import os
+import io
+import json
 import asyncio
-import tempfile
+import re
 from typing import Optional
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Configuration
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# Import proven parser
+from resume_parser_mcp import (
+    parse_resume_full, 
+    ParseResumeInput, 
+    normalize_text,
+    extract_text_from_docx_with_tables,
+    extract_all_text_from_docx,
+    ANTHROPIC_API_KEY
+)
 
 app = FastAPI(
     title="Resume Parser API",
     description="""
-## Intelligent Resume Parser with AI-First Approach
+## Enterprise Resume Parser v4.0
 
-### Features:
-- **AI-First**: Uses Claude AI for intelligent extraction (any format)
-- **Regex Fallback**: Reliable backup when AI unavailable
-- **Multi-format**: PDF, DOCX, TXT support
-- **Enterprise Grade**: Handles complex layouts, tables, text boxes
+### Architecture:
+- **Multi-Strategy Extraction**: 12+ pattern-based strategies
+- **AI Enhancement**: Claude API for complex cases
+- **Validation Agent**: Quality scoring & completeness checks
 
-### Configuration:
-Set `ANTHROPIC_API_KEY` environment variable for AI-powered parsing.
+### Supported Formats:
+- PDF (pdfplumber + PyPDF2 fallback)
+- DOCX (paragraphs + tables + text boxes)
+- TXT
+
+### Key Features:
+- Handles pipe, dash, table, worked-as formats
+- Text box extraction for sidebar layouts
+- Table extraction for structured resumes
+- Automatic duration calculation
+- Skill-to-experience mapping
     """,
-    version="3.2.0",
+    version="4.0.0",
     docs_url="/docs"
 )
 
@@ -42,191 +66,203 @@ app.add_middleware(
 )
 
 
+# =============================================================================
+# MODELS
+# =============================================================================
+
 class ParseTextRequest(BaseModel):
-    text: str = Field(..., min_length=50)
-    use_ai: bool = Field(default=True)
-    filename: Optional[str] = Field(default=None)
+    text: str = Field(..., min_length=50, description="Resume text content")
+    use_ai: bool = Field(default=True, description="Enable AI validation")
+    filename: Optional[str] = Field(default=None, description="Original filename")
 
 
-class ExtractSkillsRequest(BaseModel):
-    text: str = Field(..., min_length=10)
+class HealthResponse(BaseModel):
+    status: str
+    ai_available: bool
+    version: str
 
 
-@app.get("/", tags=["Info"])
-async def root():
-    return {
-        "name": "Resume Parser API",
-        "version": "3.2.0",
-        "docs": "/docs",
-        "ai_enabled": bool(ANTHROPIC_API_KEY),
-        "mode": "AI-First" if ANTHROPIC_API_KEY else "Regex-Only"
-    }
+# =============================================================================
+# TEXT EXTRACTION
+# =============================================================================
 
-
-@app.get("/health", tags=["Health"])
-async def health_check():
-    return {
-        "status": "healthy",
-        "ai_available": bool(ANTHROPIC_API_KEY),
-        "parser_mode": "intelligent" if ANTHROPIC_API_KEY else "regex"
-    }
-
-
-@app.post("/parse/file", tags=["Parsing"])
-async def parse_file(
-    file: UploadFile = File(...),
-    use_ai: bool = Form(default=True)
-):
-    """
-    Parse resume from PDF/DOCX file.
-    
-    - **file**: Resume file (PDF, DOCX, TXT)
-    - **use_ai**: Enable AI-powered parsing (default: true)
-    """
-    if not file.filename:
-        raise HTTPException(400, "No file provided")
-    
-    ext = file.filename.lower().split('.')[-1]
-    if ext not in ['pdf', 'docx', 'doc', 'txt']:
-        raise HTTPException(400, f"Unsupported format: {ext}")
-    
-    try:
-        content = await file.read()
-        
-        # Save to temp file for enhanced extraction
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{ext}') as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-        
-        try:
-            # Extract text based on format
-            if ext == 'pdf':
-                text = extract_pdf_text(tmp_path)
-            elif ext in ['docx', 'doc']:
-                text = extract_docx_text(tmp_path)
-            else:
-                text = content.decode('utf-8', errors='ignore')
-            
-            if len(text.strip()) < 50:
-                raise HTTPException(400, "Insufficient text extracted from file")
-            
-            # Parse using appropriate method
-            if use_ai and ANTHROPIC_API_KEY:
-                from intelligent_parser import parse_resume_intelligent
-                result = await parse_resume_intelligent(
-                    text=text,
-                    filename=file.filename,
-                    file_path=tmp_path
-                )
-            else:
-                from resume_parser_mcp import parse_resume_full, ParseResumeInput, normalize_text
-                text = normalize_text(text)
-                result = await parse_resume_full(ParseResumeInput(
-                    resume_text=text,
-                    filename=file.filename,
-                    file_path=tmp_path,
-                    use_ai_validation=False
-                ))
-            
-            import json
-            return json.loads(result)
-        
-        finally:
-            # Clean up temp file
-            os.unlink(tmp_path)
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"Parsing error: {str(e)}")
-
-
-@app.post("/parse", tags=["Parsing"])
-async def parse_text(request: ParseTextRequest):
-    """
-    Parse resume from plain text.
-    
-    - **text**: Resume text content
-    - **use_ai**: Enable AI-powered parsing (default: true)
-    """
-    try:
-        if request.use_ai and ANTHROPIC_API_KEY:
-            from intelligent_parser import parse_resume_intelligent
-            result = await parse_resume_intelligent(
-                text=request.text,
-                filename=request.filename or ""
-            )
-        else:
-            from resume_parser_mcp import parse_resume_full, ParseResumeInput, normalize_text
-            result = await parse_resume_full(ParseResumeInput(
-                resume_text=normalize_text(request.text),
-                filename=request.filename,
-                use_ai_validation=False
-            ))
-        
-        import json
-        return json.loads(result)
-    except Exception as e:
-        raise HTTPException(500, f"Parsing error: {str(e)}")
-
-
-def extract_pdf_text(file_path: str) -> str:
-    """Extract text from PDF using multiple methods."""
+def extract_text_from_pdf(content: bytes) -> str:
+    """Extract text from PDF using pdfplumber with PyPDF2 fallback."""
     text = ""
     
     # Try pdfplumber first
     try:
         import pdfplumber
-        with pdfplumber.open(file_path) as pdf:
-            text = '\n'.join([p.extract_text() or '' for p in pdf.pages])
-    except:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            text = '\n'.join([page.extract_text() or '' for page in pdf.pages])
+            if text.strip():
+                return text
+    except Exception:
         pass
     
     # Fallback to PyPDF2
-    if len(text.strip()) < 100:
-        try:
-            from PyPDF2 import PdfReader
-            reader = PdfReader(file_path)
-            text = '\n'.join([p.extract_text() or '' for p in reader.pages])
-        except:
-            pass
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(io.BytesIO(content))
+        text = '\n'.join([page.extract_text() or '' for page in reader.pages])
+    except Exception as e:
+        raise HTTPException(500, f"PDF extraction failed: {str(e)}")
     
     return text
 
 
-def extract_docx_text(file_path: str) -> str:
-    """Extract ALL text from DOCX including tables and text boxes."""
+def extract_text_from_docx(content: bytes, save_path: str = None) -> str:
+    """Extract text from DOCX including tables and text boxes."""
     from docx import Document
-    doc = Document(file_path)
     
+    doc = Document(io.BytesIO(content))
     all_text = []
     
-    # Paragraphs
+    # 1. Extract paragraphs
     for para in doc.paragraphs:
-        if para.text.strip():
-            all_text.append(para.text.strip())
+        text = para.text.strip()
+        if text:
+            all_text.append(text)
     
-    # Tables
+    # 2. Extract tables
     for table in doc.tables:
         for row in table.rows:
             row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
             if row_text:
                 all_text.append(' | '.join(row_text))
     
-    # Text boxes
+    # 3. Extract text boxes (for sidebar/multi-column layouts)
     try:
-        for txbx in doc.element.iter():
-            if txbx.tag.endswith('txbxContent'):
-                texts = [t.text for t in txbx.iter() if t.tag.endswith('}t') and t.text]
-                if texts:
-                    content = ' '.join(texts)
-                    if content not in all_text:
-                        all_text.append(content)
-    except:
+        xml_str = doc.element.xml
+        pattern = r'<w:txbxContent[^>]*>(.*?)</w:txbxContent>'
+        for match in re.findall(pattern, xml_str, re.DOTALL):
+            text_pattern = r'<w:t[^>]*>([^<]+)</w:t>'
+            texts = re.findall(text_pattern, match)
+            if texts:
+                combined = ' '.join(texts)
+                if combined.strip() and len(combined) > 5:
+                    all_text.append(combined)
+    except Exception:
         pass
     
     return '\n'.join(all_text)
 
+
+# =============================================================================
+# ENDPOINTS
+# =============================================================================
+
+@app.get("/", tags=["Info"])
+async def root():
+    """API information."""
+    return {
+        "name": "Resume Parser API",
+        "version": "4.0.0",
+        "features": [
+            "Multi-format support (PDF, DOCX, TXT)",
+            "12+ extraction patterns",
+            "AI enhancement (optional)",
+            "Table & text box extraction",
+            "Validation scoring"
+        ],
+        "ai_enabled": bool(ANTHROPIC_API_KEY),
+        "docs": "/docs"
+    }
+
+
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "ai_available": bool(ANTHROPIC_API_KEY),
+        "version": "4.0.0"
+    }
+
+
+@app.post("/parse/file", tags=["Parsing"])
+async def parse_file(
+    file: UploadFile = File(..., description="Resume file (PDF, DOCX, TXT)"),
+    use_ai: bool = Form(default=True, description="Enable AI validation")
+):
+    """
+    Parse resume from uploaded file.
+    
+    Supports: PDF, DOCX, DOC, TXT
+    
+    Returns structured data including:
+    - Contact info (name, email, phone, linkedin)
+    - Work experience with responsibilities
+    - Education history
+    - Certifications
+    - Technical skills with experience mapping
+    """
+    if not file.filename:
+        raise HTTPException(400, "No file provided")
+    
+    ext = file.filename.lower().split('.')[-1]
+    if ext not in ['pdf', 'docx', 'doc', 'txt']:
+        raise HTTPException(400, f"Unsupported format: {ext}. Use PDF, DOCX, or TXT")
+    
+    try:
+        content = await file.read()
+        
+        # Extract text based on file type
+        if ext == 'pdf':
+            text = extract_text_from_pdf(content)
+        elif ext in ['docx', 'doc']:
+            text = extract_text_from_docx(content)
+        else:
+            text = content.decode('utf-8', errors='ignore')
+        
+        if len(text.strip()) < 50:
+            raise HTTPException(400, "Insufficient text extracted from file")
+        
+        # Parse using proven multi-strategy parser
+        result = await parse_resume_full(ParseResumeInput(
+            resume_text=text,
+            filename=file.filename,
+            use_ai_validation=use_ai and bool(ANTHROPIC_API_KEY)
+        ))
+        
+        return json.loads(result)
+        
+    except HTTPException:
+        raise
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"JSON parsing error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(500, f"Parsing error: {str(e)}")
+
+
+@app.post("/parse/text", tags=["Parsing"])
+async def parse_text(request: ParseTextRequest):
+    """
+    Parse resume from raw text.
+    
+    Useful for:
+    - Text already extracted from documents
+    - Copy-pasted resume content
+    - Testing and debugging
+    """
+    try:
+        result = await parse_resume_full(ParseResumeInput(
+            resume_text=request.text,
+            filename=request.filename or "text_input",
+            use_ai_validation=request.use_ai and bool(ANTHROPIC_API_KEY)
+        ))
+        
+        return json.loads(result)
+        
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"JSON parsing error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(500, f"Parsing error: {str(e)}")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 if __name__ == "__main__":
     import uvicorn
