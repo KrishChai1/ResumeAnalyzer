@@ -176,15 +176,138 @@ def normalize_text(text: str) -> str:
     text = text.replace('\u2022', '•').replace('\u00a0', ' ')
     text = text.replace('\r\n', '\n').replace('\r', '\n').replace('\t', ' ')
     
+    # Normalize double dashes to single dash (common in markdown date ranges like "Jan -- Feb")
+    # But preserve horizontal rules (lines that are ONLY dashes/spaces)
+    def fix_double_dashes(match):
+        line = match.group(0)
+        # If line is only dashes and whitespace, preserve it
+        if re.match(r'^[\s-]*$', line):
+            return line
+        # Otherwise convert double+ dashes to single
+        return re.sub(r'--+', '-', line)
+    text = re.sub(r'^.*$', fix_double_dashes, text, flags=re.MULTILINE)
+    
     # Fix common PDF issues
     text = re.sub(r'Pres\s*ent', 'Present', text, flags=re.IGNORECASE)
     text = re.sub(r'US\s*A', 'USA', text)
+    
+    # Clean markdown formatting
+    text = clean_markdown_text(text)
+    
+    # Join split date lines (e.g., "Jan 2023 - Jun\n2025" -> "Jan 2023 - Jun 2025")
+    # Pattern: line ends with month and dash, next line starts with year
+    text = re.sub(
+        r'((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*[-–])\s*\n\s*(\d{4})',
+        r'\1 \2',
+        text,
+        flags=re.IGNORECASE
+    )
+    
+    # Also join lines where year wraps: "Jun\n2025" -> "Jun 2025"
+    text = re.sub(
+        r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*)\s*\n\s*(\d{4})',
+        r'\1 \2',
+        text,
+        flags=re.IGNORECASE
+    )
+    
+    # Remove trailing backslashes at end of lines (markdown line breaks)
+    text = re.sub(r'\\\s*$', '', text, flags=re.MULTILINE)
     
     text = unicodedata.normalize('NFKC', text)
     text = re.sub(r' +', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     
     return text.strip()
+
+
+def clean_markdown_text(text: str) -> str:
+    """Clean markdown formatting from text files."""
+    if not text:
+        return ""
+    
+    # First pass: Join wrapped/continued lines (lines starting with > or heavy indentation)
+    lines = text.split('\n')
+    joined_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # If this line starts a sentence and next lines are continuations
+        if i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            # Check if next line is a continuation (starts with > or is heavily indented)
+            if (next_line.startswith('>') or 
+                (lines[i + 1].startswith('    ') and not next_line.startswith(('•', '-', '*', '#')))):
+                # Join continuation lines
+                combined = line
+                j = i + 1
+                while j < len(lines):
+                    cont_line = lines[j]
+                    cont_stripped = cont_line.strip()
+                    # Remove leading > from continuation
+                    cont_stripped = re.sub(r'^>\s*', '', cont_stripped)
+                    if cont_stripped and not cont_stripped.startswith(('•', '-', '*', '#', '**')):
+                        if cont_line.startswith('    ') or cont_line.strip().startswith('>'):
+                            combined += ' ' + cont_stripped
+                            j += 1
+                            continue
+                    break
+                joined_lines.append(combined)
+                i = j
+                continue
+        joined_lines.append(line)
+        i += 1
+    text = '\n'.join(joined_lines)
+    
+    # Remove markdown bold/italic markers (handle multiline)
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # **bold** -> bold
+    text = re.sub(r'\*([^*]+)\*', r'\1', text)  # *italic* -> italic
+    text = re.sub(r'__([^_]+)__', r'\1', text)  # __bold__ -> bold
+    text = re.sub(r'_([^_]+)_', r'\1', text)  # _italic_ -> italic
+    
+    # Remove markdown headers but preserve the text
+    text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)  # # Header -> Header
+    
+    # Remove markdown links but keep text: [text](url) -> text
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    
+    # Remove markdown blockquote markers (>)
+    text = re.sub(r'^>\s*', '', text, flags=re.MULTILINE)
+    
+    # Remove horizontal rules (various formats)
+    text = re.sub(r'^[-_=]{3,}\s*$', '', text, flags=re.MULTILINE)  # --- or ___ or ===
+    text = re.sub(r'^\+[-+]+\+\s*$', '', text, flags=re.MULTILINE)  # +---+---+ table borders
+    text = re.sub(r'^[-]{10,}$', '', text, flags=re.MULTILINE)  # Long dashes --------
+    
+    # Remove table cell separators and table formatting
+    text = re.sub(r'\|\s*\|', ' | ', text)
+    text = re.sub(r'^\|\s*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^:\s+Layout table\s*$', '', text, flags=re.MULTILINE)
+    
+    # Remove backslash escapes BEFORE pipes to preserve date separators
+    text = text.replace('\\|', '|')
+    text = text.replace('\\n', ' ')
+    text = text.replace('\\\\', ' ')
+    text = re.sub(r'\\([^\s])', r'\1', text)  # \char -> char (but not \space)
+    
+    # Remove {.underline} and similar markdown attributes
+    text = re.sub(r'\{[^}]+\}', '', text)
+    
+    # Clean up list markers at line start (handle various bullet formats)
+    text = re.sub(r'^[-•·]\s{2,}', '• ', text, flags=re.MULTILINE)
+    text = re.sub(r'^-\s+', '• ', text, flags=re.MULTILINE)  # - item -> • item
+    
+    # Clean up table format patterns
+    text = re.sub(r'\+[-=]+\+', '', text)  # +====+ or +----+
+    text = re.sub(r'\|[-=]+\|', '', text)  # |----| or |====|
+    
+    # Remove lines that are just dashes and spaces
+    text = re.sub(r'^[\s-]+$', '', text, flags=re.MULTILINE)
+    
+    # Clean multiple empty lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    return text
 
 
 def extract_text_from_docx_with_tables(file_path: str) -> str:
@@ -636,16 +759,21 @@ def extract_name(text: str) -> Tuple[str, str, str]:
         'experienced', 'skilled', 'dedicated', 'professional with', 'having',
         'languages', 'cloud', 'web applications', 'version', 'configuration',
         'operating', 'databases', 'tools', 'contact', 'phone', 'email', 'ph:',
-        'work experience', 'work location', 'key skills', 'domain:',
+        'work experience', 'work location', 'key skills', 'domain:', 'domain',
         'data engineering', 'software engineering', 'governance', 'with over',
-        'executive reporting', 'executive summary', 'total', 'years of'
+        'executive reporting', 'executive summary', 'total', 'years of',
+        'technical and', 'technology', 'successfully', 'achieved', 'zero',
+        'improved', 'facilitated', 'received', 'cross skilled', 'i am', 'i have',
+        'i possess', '• ', '- ', '* ', 'system', 'database', 'networking'
     ]
     
     # Full patterns to skip (exact match after lowercase)
     skip_exact_patterns = [
         'technical skills', 'professional skills', 'key skills', 'core skills',
         'work experience', 'professional experience', 'contact information',
-        'contact details', 'personal information', 'personal details'
+        'contact details', 'personal information', 'personal details',
+        'domain skills', 'technical and', 'operating system', 'technology',
+        'technology / languages', 'technical summary', 'professional summary'
     ]
     
     for line in lines:
@@ -716,6 +844,60 @@ def extract_name(text: str) -> Tuple[str, str, str]:
                 return name_parts[0], "", ""
     
     return "", "", ""
+
+
+def extract_name_from_filename(filename: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Extract name from filename as fallback when text extraction fails.
+    Common patterns:
+    - FirstName_LastName_Title.docx
+    - FirstName_MiddleName_LastName_Title.docx
+    - FirstLastName_Resume.pdf
+    """
+    if not filename:
+        return None
+    
+    # Remove extension
+    name = re.sub(r'\.(docx?|pdf|txt)$', '', filename, flags=re.IGNORECASE)
+    
+    # Common suffixes to remove (order matters - remove longer patterns first)
+    suffixes_to_remove = [
+        r'[-_\s]?(resume|cv|curriculum[_\s]?vitae)',
+        r'[-_\s]?\d+$',  # Version numbers at end
+        r'[-_\s]?(sr|senior|jr|junior)[-_\s]?(developer|engineer|manager|analyst|consultant|architect)',
+        r'[-_\s]?(java|python|etl|gcp|aws|azure|devops|snowflake|data)[-_\s]?(developer|engineer)',
+        r'[-_\s]?(developer|engineer|manager|analyst|consultant|architect|lead|specialist)',
+        r'[-_\s]?(gcp|aws|azure|devops|snowflake)$',  # Cloud platform suffixes
+    ]
+    
+    for pattern in suffixes_to_remove:
+        name = re.sub(pattern, '', name, flags=re.IGNORECASE)
+    
+    # Clean up any trailing numbers or underscores
+    name = re.sub(r'[-_\s\d]+$', '', name)
+    
+    # Split by underscores, dashes, or spaces
+    parts = re.split(r'[_\-\s]+', name)
+    parts = [p for p in parts if p and len(p) > 1]
+    
+    # Filter out common non-name words
+    non_name_words = {'resume', 'cv', 'new', 'updated', 'final', 'copy', 'v1', 'v2', 
+                      'gcp', 'aws', 'azure', 'data', 'engineer', 'developer', 'sr', 'junior'}
+    parts = [p for p in parts if p.lower() not in non_name_words]
+    
+    if len(parts) >= 2:
+        # Capitalize parts
+        parts = [p.capitalize() for p in parts]
+        
+        if len(parts) == 2:
+            return parts[0], "", parts[1]
+        elif len(parts) == 3:
+            return parts[0], parts[1], parts[2]
+        elif len(parts) >= 4:
+            # Take first 3 as name (FirstName MiddleName LastName)
+            return parts[0], ' '.join(parts[1:-1]), parts[-1]
+    
+    return None
 
 
 def extract_title(text: str, experiences: List[ExperienceEntry]) -> str:
@@ -1928,9 +2110,13 @@ def extract_experiences(text: str) -> List[ExperienceEntry]:
                     # Keep full title (including suffix like "– Cognizant Infra Services")
                     title = title_part.split('|')[0].strip()
                     
-                    # Previous line is company
-                    if i > 0:
-                        prev_line = lines[i - 1].strip()
+                    # Previous line is company - skip empty lines
+                    prev_idx = i - 1
+                    while prev_idx >= 0 and not lines[prev_idx].strip():
+                        prev_idx -= 1
+                    
+                    if prev_idx >= 0:
+                        prev_line = lines[prev_idx].strip()
                         loc_match = re.search(r'[-–]\s*(.+)$', prev_line)
                         if loc_match:
                             employer = prev_line[:prev_line.find('-')].strip()
@@ -2240,11 +2426,12 @@ def extract_education(text: str) -> List[Dict[str, str]]:
     seen_degrees = set()  # Track unique degrees to avoid duplicates
     
     # Job titles to filter out - these should NOT be in education
+    # Use word boundaries and avoid matching education fields like "Engineering"
     job_title_patterns = [
-        r'specialist', r'manager', r'engineer', r'developer', r'analyst', r'consultant',
-        r'director', r'lead', r'architect', r'administrator', r'coordinator', r'executive',
-        r'officer', r'supervisor', r'head\s+of', r'vp\b', r'vice\s+president', r'delivery',
-        r'global\s+business', r'professional\s+services', r'directed', r'led\s+', r'managed'
+        r'\bspecialist\b', r'\bmanager\b', r'\bengineer\b(?!ing)', r'\bdeveloper\b', r'\banalyst\b', r'\bconsultant\b',
+        r'\bdirector\b', r'\blead\b', r'\barchitect\b', r'\badministrator\b', r'\bcoordinator\b', r'\bexecutive\b',
+        r'\bofficer\b', r'\bsupervisor\b', r'\bhead\s+of\b', r'\bvp\b', r'\bvice\s+president\b', r'\bdelivery\b',
+        r'\bglobal\s+business\b', r'\bprofessional\s+services\b', r'\bdirected\b', r'\bled\s+', r'\bmanaged\b'
     ]
     
     def is_job_title(text: str) -> bool:
@@ -2252,13 +2439,18 @@ def extract_education(text: str) -> List[Dict[str, str]]:
         if not text:
             return False
         text_lower = text.lower()
+        # Don't flag if it contains education keywords
+        edu_keywords = ['bachelor', 'master', 'degree', 'diploma', 'b.tech', 'm.tech', 'mba', 'mca', 'bca', 'ph.d']
+        if any(kw in text_lower for kw in edu_keywords):
+            return False
         return any(re.search(p, text_lower) for p in job_title_patterns)
     
     # Find education section (multiple possible headers)
     # IMPORTANT: Require EDUCATION to be at the START of a line (section header)
     # This avoids matching "executive education" in the middle of text
+    # Handle bracketed headers like [EDUCATIONAL QUALIFICATION:] and plain headers like EDUCATION
     edu_match = re.search(
-        r'^(?:EDUCATION(?:AL)?\s*(?:QUALIFICATION|BACKGROUND|DETAILS)?|ACADEMIC\s*(?:QUALIFICATION|BACKGROUND)?)[:\s]*\n(.+?)(?:\nROLES|\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nPERSONAL|\nCERTIFI|\nCORE|\nAS\s+A\s+SCRUM|\nSKILLS|\nACHIEVEMENT|\nTOOLS|\n_+|\Z)',
+        r'^\[?(?:EDUCATION(?:AL)?\s*(?:QUALIFICATION|BACKGROUND|DETAILS)?|ACADEMIC\s*(?:QUALIFICATION|BACKGROUND)?)[:\]]*\s*\n(.+?)(?:\n\[?(?:ROLES|PROFESSIONAL|WORK|TECHNICAL|PERSONAL|CERTIFI|CORE|SKILLS|ACHIEVEMENT|TOOLS)|\nAS\s+A\s+SCRUM|\n_+|\Z)',
         text, re.IGNORECASE | re.DOTALL | re.MULTILINE
     )
     
@@ -2295,12 +2487,30 @@ def extract_education(text: str) -> List[Dict[str, str]]:
     # Single-line "Education: Degree at/from Institution" format (Ramaswamy style)
     # Example: "Education: Master of Computer Application (M.C.A) at Osmania University, India"
     single_line_edu = re.search(
-        r'Education[:\s]+([A-Za-z]+(?:\'s)?\s+of\s+[A-Za-z\s()\.]+)\s+(?:at|from)\s+([A-Za-z\s]+(?:University|College|Institute)[A-Za-z\s,]*)',
+        r'Education[:\s]+([A-Za-z]+(?:\'s)?\s+of\s+[A-Za-z\s()\.]+)\s+(?:at|from)\s+([A-Za-z\s]+(?:University|College|Institute)[A-Za-z ,]*?)(?:\n|$)',
         text, re.IGNORECASE
     )
     if single_line_edu:
         degree = single_line_edu.group(1).strip()
         institution = single_line_edu.group(2).strip()
+        degree_key = degree.lower()
+        if degree_key not in seen_degrees:
+            seen_degrees.add(degree_key)
+            education.append({
+                'degree': degree,
+                'institution': institution,
+                'year': None
+            })
+    
+    # Table-format education: "| Education | > Master of Computer Application (M.C.A) at | | > Osmania University, India |"
+    # This handles markdown table formats where education spans multiple cells
+    table_edu_match = re.search(
+        r'\|\s*Education\s*\|\s*>?\s*([^|]+?)\s+(?:at|from)\s*\|\s*\|?\s*>?\s*([^|]+)',
+        text, re.IGNORECASE
+    )
+    if table_edu_match and not education:
+        degree = table_edu_match.group(1).strip()
+        institution = table_edu_match.group(2).strip().rstrip('|').strip()
         degree_key = degree.lower()
         if degree_key not in seen_degrees:
             seen_degrees.add(degree_key)
@@ -2352,10 +2562,24 @@ def extract_education(text: str) -> List[Dict[str, str]]:
         while i < len(lines):
             line = lines[i]
             
-            # Skip irrelevant lines
-            if re.match(r'^(Worked|Working|•|-|\*|PROFESSIONAL|Roles|As\s+a\s+Scrum|Facilitate|Client:|Role|Analysis|Find|Set up|Duration)', line, re.IGNORECASE):
+            # Skip irrelevant lines - BUT preserve bullet lines with education keywords
+            skip_start_patterns = r'^(Worked|Working|PROFESSIONAL|Roles|As\s+a\s+Scrum|Facilitate|Client:|Role|Analysis|Find|Set up|Duration)'
+            if re.match(skip_start_patterns, line, re.IGNORECASE):
                 i += 1
                 continue
+            
+            # Handle bullet points - strip bullet and check for education content
+            if re.match(r'^[•\-\*]\s*', line):
+                stripped_line = re.sub(r'^[•\-\*]\s*', '', line).strip()
+                # Check if it contains education keywords - if so, process it
+                edu_keywords = [r'master', r'bachelor', r'mba', r'mca', r'bca', r'b\.?tech', r'm\.?tech', 
+                               r'b\.?e\b', r'm\.?e\b', r'ph\.?d', r'engineering', r'science', r'arts', 
+                               r'university', r'college', r'institute', r'degree', r'diploma']
+                if any(re.search(kw, stripped_line, re.IGNORECASE) for kw in edu_keywords):
+                    line = stripped_line  # Use the stripped line for processing
+                else:
+                    i += 1
+                    continue  # Skip non-education bullet points
             
             # CRITICAL: Skip lines that look like job/company headers (pipe with year range AND location)
             # Example to skip: "Samsung Electronics | Plano, TX | 2020 - 2024"
@@ -2462,11 +2686,23 @@ def extract_education(text: str) -> List[Dict[str, str]]:
                     continue
             
             # Format 4: "Degree From Institution Year" (Madhuri format)
-            from_match = re.match(r'^(.+?)\s+[Ff]rom\s+(.+?)\s+(?:\w+\s+)?(\d{4})$', line)
+            # Use greedy capture for institution up to the year
+            from_match = re.match(r'^(.+?)\s+[Ff]rom\s+(.+?)(?:\s+(?:January|February|March|April|May|June|July|August|September|October|November|December|\d{1,2}[/-]))?[\s,]*(\d{4})$', line)
             if from_match:
                 entry['degree'] = from_match.group(1).strip()
                 entry['institution'] = from_match.group(2).strip()
                 entry['year'] = from_match.group(3)
+                education.append(entry)
+                i += 1
+                continue
+            
+            # Format 4b: "Degree, Institution. (Year)" (Naveen style)
+            # Example: "Masters in electrical engineering, NPU, CA, USA. (2008)"
+            paren_year_match = re.match(r'^(.+?),\s*(.+?)\.?\s*\((\d{4})\)\s*$', line)
+            if paren_year_match:
+                entry['degree'] = paren_year_match.group(1).strip()
+                entry['institution'] = paren_year_match.group(2).strip()
+                entry['year'] = paren_year_match.group(3)
                 education.append(entry)
                 i += 1
                 continue
@@ -2768,7 +3004,8 @@ def validation_agent(parsed: Dict, text: str) -> ValidationResult:
             result.score -= 5
     
     # Name sanity check - should not be tech terms
-    name = pr.get("name", "").lower()
+    name = pr.get("name") or ""
+    name = name.lower() if name else ""
     invalid_names = ["sql server", "data engineer", "software engineer", "project manager", 
                      "key expertise", "additional details", "professional", "reporting tools",
                      "results-driven", "experienced", "senior"]
@@ -3147,6 +3384,13 @@ async def parse_resume_full(params: ParseResumeInput) -> str:
     # =========================================================================
     contact = extract_contact(text)
     firstname, middle, lastname = extract_name(text)
+    
+    # Fallback: try to extract name from filename if text extraction failed
+    if not firstname and not lastname and params.filename:
+        name_from_filename = extract_name_from_filename(params.filename)
+        if name_from_filename:
+            firstname, middle, lastname = name_from_filename
+    
     experiences = extract_experiences(text)
     education = extract_education(text)
     certifications = extract_certifications(text)
@@ -3352,4 +3596,3 @@ if MCP_AVAILABLE and mcp:
 if __name__ == "__main__":
     if MCP_AVAILABLE and mcp:
         mcp.run()
- 
