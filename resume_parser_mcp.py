@@ -1950,6 +1950,47 @@ async def extract_skills_endpoint(request: ExtractSkillsRequest):
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                    COMPATIBILITY EXPORTS FOR api_server.py                   ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+class ResponseFormat(str, Enum):
+    """Response format enum for compatibility."""
+    JSON = "json"
+    MARKDOWN = "markdown"
+
+
+class ParseResumeInput(BaseModel):
+    """Input model for parse_resume_full - compatibility with api_server.py."""
+    resume_text: str = Field(..., min_length=50, max_length=500000)
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+    filename: Optional[str] = Field(default=None)
+    file_path: Optional[str] = Field(default=None)
+    use_ai_validation: bool = Field(default=True)
+
+
+async def parse_resume_full(params: ParseResumeInput) -> str:
+    """
+    Compatibility wrapper for api_server.py imports.
+    Converts ParseResumeInput to parse_resume() call and returns JSON string.
+    """
+    result = await parse_resume(
+        text=params.resume_text,
+        filename=params.filename,
+        use_ai=params.use_ai_validation
+    )
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+def extract_technical_skills(text: str) -> List[str]:
+    """
+    Compatibility alias for extract_skills().
+    Returns flat list of skills instead of categorized dict.
+    """
+    categorized = extract_skills(text)
+    return [skill for skills_list in categorized.values() for skill in skills_list]
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║                           MAIN ENTRY POINT                                   ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
