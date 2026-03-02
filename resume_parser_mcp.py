@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.1.1"
+VERSION = "8.2.0"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -313,49 +313,72 @@ def detect_file_type(content: bytes, filename: str) -> str:
 
 
 def extract_text_from_pdf(content: bytes) -> str:
-    """Extract text from PDF using multiple methods."""
-    text = ""
+    """Extract text from PDF using multiple methods combined."""
+    texts = []
     
-    # Try pdfplumber first
+    # Method 1: pdfplumber (good for structured layouts)
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             for page in pdf.pages:
+                # Extract main text
                 page_text = page.extract_text()
                 if page_text:
-                    text += page_text + "\n"
-        if text.strip():
-            return text
+                    texts.append(page_text)
+                
+                # Also extract from tables
+                try:
+                    tables = page.extract_tables()
+                    for table in tables:
+                        for row in table:
+                            if row:
+                                row_text = ' | '.join(str(c) if c else '' for c in row)
+                                if row_text.strip():
+                                    texts.append(row_text)
+                except:
+                    pass
     except ImportError:
         pass
     except Exception:
         pass
     
-    # Try PyPDF2
+    # Method 2: PyPDF2 (may extract different text areas including sidebars)
     try:
         from PyPDF2 import PdfReader
         reader = PdfReader(io.BytesIO(content))
         for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
-                text += page_text + "\n"
+                # Only add if it contains text not already captured
+                texts.append(page_text)
     except Exception:
         pass
     
-    # Try zipfile method for special PDFs
-    if not text.strip():
-        try:
-            with zipfile.ZipFile(io.BytesIO(content)) as z:
-                text_files = sorted(
-                    [n for n in z.namelist() if n.endswith('.txt')],
-                    key=lambda x: int(x.split('.')[0]) if x.split('.')[0].isdigit() else 999
-                )
-                for tf in text_files:
-                    text += z.read(tf).decode('utf-8', errors='ignore') + "\n"
-        except:
-            pass
+    # Method 3: zipfile for special PDFs (Apple exports)
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as z:
+            text_files = sorted(
+                [n for n in z.namelist() if n.endswith('.txt')],
+                key=lambda x: int(x.split('.')[0]) if x.split('.')[0].isdigit() else 999
+            )
+            for tf in text_files:
+                texts.append(z.read(tf).decode('utf-8', errors='ignore'))
+    except:
+        pass
     
-    return text
+    # Combine all extracted text
+    combined = '\n'.join(texts)
+    
+    # Deduplicate lines while preserving order
+    seen = set()
+    unique_lines = []
+    for line in combined.split('\n'):
+        line_clean = line.strip()
+        if line_clean and line_clean not in seen:
+            seen.add(line_clean)
+            unique_lines.append(line)
+    
+    return '\n'.join(unique_lines)
 
 
 def extract_text_from_docx(content: bytes) -> str:
