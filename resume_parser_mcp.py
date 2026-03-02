@@ -761,13 +761,14 @@ def extract_responsibilities(lines: List[str], start_idx: int, end_idx: int) -> 
     """Extract responsibilities from lines (helper function)."""
     responsibilities = []
     current_resp = ""
+    bullet_only_line = False  # Track if previous line was just a bullet
     
     for i in range(start_idx, min(end_idx, len(lines))):
         line = lines[i]
-        stripped = line.strip()
+        stripped = line.strip().rstrip('\r')
         
         # Stop at section headers
-        if re.match(r'^(EDUCATION|TECHNICAL|SKILLS|CERTIFICATIONS|PERSONAL|EXPERIENCE)', stripped, re.IGNORECASE):
+        if re.match(r'^(EDUCATION|TECHNICAL|SKILLS|CERTIFICATIONS|PERSONAL|EXPERIENCE\s*$)', stripped, re.IGNORECASE):
             break
         
         # Stop at next experience (date pattern)
@@ -776,19 +777,36 @@ def extract_responsibilities(lines: List[str], start_idx: int, end_idx: int) -> 
         if re.match(r'^\d{1,2}/\d{4}\s*[-–]', stripped):
             break
         
-        # New bullet point
+        # Check for standalone bullet (Javvaji PDF pattern: "■\r" on its own line)
+        if stripped in ('■', '•', '-', '*', '>'):
+            # Save current responsibility if exists
+            if current_resp and len(current_resp) > 20:
+                responsibilities.append(current_resp.strip()[:500])
+            current_resp = ""
+            bullet_only_line = True
+            continue
+        
+        # New bullet point with text
         if stripped.startswith(('■', '•', '-', '*', '>')) or re.match(r'^\d+\.', stripped):
             if current_resp and len(current_resp) > 20:
                 responsibilities.append(current_resp.strip()[:500])
             current_resp = re.sub(r'^[■•\-\*>\d.]+\s*', '', stripped)
-        # Continuation (indented line)
-        elif current_resp and (line.startswith('    ') or line.startswith('\t') or (stripped and not stripped[0].isupper())):
-            current_resp += ' ' + stripped
-        # Stop at blank line if we have content
+            bullet_only_line = False
+        # Text following a standalone bullet
+        elif bullet_only_line and stripped:
+            current_resp = stripped
+            bullet_only_line = False
+        # Continuation (indented line or continuation text)
+        elif current_resp and stripped:
+            # Check if it's a continuation (doesn't start with uppercase or is indented)
+            if line.startswith('    ') or line.startswith('\t') or not stripped[0].isupper() or len(stripped) < 60:
+                current_resp += ' ' + stripped
+        # Blank line - save current
         elif not stripped and current_resp:
             if len(current_resp) > 20:
                 responsibilities.append(current_resp.strip()[:500])
             current_resp = ""
+            bullet_only_line = False
     
     if current_resp and len(current_resp) > 20:
         responsibilities.append(current_resp.strip()[:500])
@@ -1001,12 +1019,41 @@ def extract_experiences(text: str) -> List[Dict]:
     
     # =========================================================================
     # PATTERN 8: "**Client: Company -- Location Date**" (Naveen)
+    # Handles multiple formats:
+    # - Client: Ascent Global Logistics -- Atlanta, GA. Jul24 to Present
+    # - Client: Hiscox Inc - Atlanta, Georgia Feb'20 to May'21
+    # - Client: UnitedHealth Group, India May'14 to Dec'14 (comma format)
+    # - Client: Berkley Technology Services - Des Moines, IA Aug'15 to\nJan'20 (multiline)
     # =========================================================================
-    client_pattern = r'\*?\*?Client:\s*(.+?)\s+[-–]\s+([A-Za-z][^.]+?)\.?\s*((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z\']*\s*\d{2,4})\s+to\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z\']*\s*\d{2,4}|Present|Current|July\s*\d{2,4})\*?\*?'
     
-    for i, line in enumerate(lines):
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         clean_line = re.sub(r'\*\*', '', line.strip())
-        match = re.match(client_pattern, clean_line, re.IGNORECASE)
+        
+        if not re.match(r'^Client:', clean_line, re.IGNORECASE):
+            i += 1
+            continue
+        
+        # Combine with next line in case date spans multiple lines
+        combined = clean_line
+        if i + 1 < len(lines):
+            next_line = re.sub(r'\*\*', '', lines[i + 1].strip())
+            if next_line and not next_line.startswith(('Client:', '•', '-', '*', '■')):
+                combined += ' ' + next_line
+        
+        # Try multiple patterns
+        match = None
+        
+        # Pattern A: "Client: Company -- Location. Date to Date"
+        # Pattern B: "Client: Company - Location Date to Date"  
+        pattern_a = r'Client:\s*(.+?)\s+[-–]+\s+([A-Za-z][A-Za-z\s,]+?)\.?\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z\']*\s*\d{2,4})\s+to\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z\']*\s*\d{2,4}|Present|Current)'
+        match = re.match(pattern_a, combined, re.IGNORECASE)
+        
+        if not match:
+            # Pattern B: "Client: Company, Location Date to Date" (comma format)
+            pattern_b = r'Client:\s*(.+?),\s*([A-Za-z][A-Za-z\s]+?)\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z\']*\s*\d{2,4})\s+to\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z\']*\s*\d{2,4}|Present|Current)'
+            match = re.match(pattern_b, combined, re.IGNORECASE)
         
         if match:
             employer = match.group(1).strip()
@@ -1018,14 +1065,29 @@ def extract_experiences(text: str) -> List[Dict]:
             end_year, end_month, is_present = parse_date(end_str)
             
             if start_year and end_year:
+                # Look for title in next 5 lines (skip blank lines)
                 title = ""
-                if i + 1 < len(lines):
-                    next_line = re.sub(r'\*\*', '', lines[i + 1].strip())
-                    if next_line and not next_line.startswith(('Client:', '•', '-', '*', '■')):
-                        if not re.search(r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', next_line, re.IGNORECASE):
+                title_line_idx = i + 1
+                for j in range(i + 1, min(i + 6, len(lines))):
+                    next_line = re.sub(r'\*\*', '', lines[j].strip())
+                    if not next_line:
+                        continue
+                    if next_line.startswith(('Client:', 'Responsibilities', 'Description', 'Tech Stack')):
+                        break
+                    # Skip the date continuation line
+                    if re.match(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z']*\s*\d{2,4}$", next_line, re.IGNORECASE):
+                        continue
+                    if not re.search(r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z\']*\s*\d{2,4}\s+to', next_line, re.IGNORECASE):
+                        if any(kw in next_line for kw in ['Developer', 'Engineer', 'Analyst', 'Manager', 'Lead', 'Consultant', 'Architect', 'Admin', 'SSIS', 'MSBI', 'ETL', 'DBA', 'Database']):
                             title = next_line
+                            title_line_idx = j
+                            break
+                        elif len(next_line) < 60 and next_line[0].isupper():
+                            title = next_line
+                            title_line_idx = j
+                            break
                 
-                responsibilities = extract_responsibilities(lines, i + 2, i + 25)
+                responsibilities = extract_responsibilities(lines, title_line_idx + 1, i + 50)
                 
                 duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
                 start_date = f"{start_year}-{(start_month or 1):02d}"
@@ -1048,6 +1110,8 @@ def extract_experiences(text: str) -> List[Dict]:
                         'location': location,
                         'pattern': 8
                     })
+        
+        i += 1
     
     # =========================================================================
     # PATTERN 10: "## Title | Company, Location | Date" (Steven markdown)
@@ -1217,24 +1281,47 @@ def extract_experiences(text: str) -> List[Dict]:
     
     # =========================================================================
     # PATTERN 3: Table format "Client: X | Duration: Y" (Ramaswamy)
+    # Handles multi-line tables where client/duration span multiple rows
     # =========================================================================
-    for i, line in enumerate(lines):
-        if 'client:' in line.lower():
-            combined = ' '.join(lines[i:min(i+8, len(lines))])
-            combined = re.sub(r'[\*>]', '', combined)
-            combined = re.sub(r'\s+', ' ', combined)
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if 'client:' in line.lower() and 'duration' in ' '.join(lines[i:min(i+5, len(lines))]).lower():
+            # Combine up to 10 lines to capture multi-line table cells
+            combined = ' '.join(lines[i:min(i+10, len(lines))])
+            combined = re.sub(r'[\*>|+=#]', ' ', combined)  # Remove table chars
+            combined = re.sub(r'\s+', ' ', combined)  # Normalize whitespace
             
-            client_match = re.search(r'Client:\s*([A-Za-z][A-Za-z\s&]+?)(?:\s*\||$)', combined, re.IGNORECASE)
+            # Extract client name - stop at Duration
+            client_match = re.search(r'Client:\s*([A-Za-z][A-Za-z0-9\s&]+?)(?:\s+Duration|\s+Brief|\s*$)', combined, re.IGNORECASE)
             if not client_match:
+                i += 1
                 continue
             employer = client_match.group(1).strip()
+            # Clean up employer name (remove trailing words like "Bank" that appear twice)
+            employer = re.sub(r'\s+(Healthcare|Bank|Power|Water)\s*$', '', employer, flags=re.IGNORECASE).strip()
             
-            duration_match = re.search(r'Duration:?\s*([A-Za-z]+)[-\s]*(\d{4})\s*to\s*([A-Za-z]+[-\s]*\d{4}|Till\s*date|Present)', combined, re.IGNORECASE)
+            # Extract duration - more flexible pattern
+            # Allow extra words between "to" and end date
+            duration_match = re.search(
+                r'Duration[*:\s]*([A-Za-z]+)[-\s]*(\d{4})\s+to\s+(?:[A-Za-z]+\s+)?([A-Za-z]+[-\s]*\d{4}|Till\s*date|Present|Current)',
+                combined, re.IGNORECASE
+            )
             if not duration_match:
-                continue
-            
-            start_str = f"{duration_match.group(1)} {duration_match.group(2)}"
-            end_str = duration_match.group(3)
+                # Try simpler pattern
+                duration_match = re.search(
+                    r'Duration[*:\s]*([A-Za-z]{3,9})[-\s]*(\d{4})\s+to\s+.*?([A-Za-z]{3,9})[-\s]*(\d{4})',
+                    combined, re.IGNORECASE
+                )
+                if duration_match:
+                    start_str = f"{duration_match.group(1)} {duration_match.group(2)}"
+                    end_str = f"{duration_match.group(3)} {duration_match.group(4)}"
+                else:
+                    i += 1
+                    continue
+            else:
+                start_str = f"{duration_match.group(1)} {duration_match.group(2)}"
+                end_str = duration_match.group(3)
             
             start_year, start_month, _ = parse_date(start_str)
             end_year, end_month, is_present = parse_date(end_str)
@@ -1242,13 +1329,37 @@ def extract_experiences(text: str) -> List[Dict]:
             if start_year and end_year:
                 duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
                 
+                # Try to extract title/role from nearby lines
                 title = "Consultant"
-                role_matches = re.findall(r'((?:Senior\s+)?(?:Data|Software|Cloud|GCP)\s+Engineer|Analyst|Developer|Architect)', combined, re.IGNORECASE)
-                if role_matches:
-                    title = role_matches[0]
+                role_patterns = [
+                    r'((?:Senior\s+)?(?:Data|Software|Cloud|GCP|ETL|BI|Snowflake)\s+(?:Engineer|Analyst|Developer|Architect|Consultant))',
+                    r'((?:Lead|Sr\.?|Senior)\s+\w+\s+(?:Engineer|Developer|Analyst))',
+                    r'Role[:\s]+([A-Za-z\s]+(?:Engineer|Developer|Analyst|Consultant))'
+                ]
+                for pattern in role_patterns:
+                    role_match = re.search(pattern, combined, re.IGNORECASE)
+                    if role_match:
+                        title = role_match.group(1).strip()
+                        break
                 
                 start_date = f"{start_year}-{(start_month or 1):02d}"
                 end_date = f"{end_year}-{(end_month or 12):02d}" if not is_present else f"{datetime.now().year}-{datetime.now().month:02d}"
+                
+                # Extract responsibilities from table cells
+                responsibilities = []
+                for j in range(i + 1, min(i + 60, len(lines))):
+                    resp_line = lines[j]
+                    # Stop at next Client entry
+                    if 'Client:' in resp_line and j > i + 2:
+                        break
+                    # Look for content in table cells
+                    if '|' in resp_line:
+                        cells = re.findall(r'\|\s*([^|]+)', resp_line)
+                        for cell in cells:
+                            cell = re.sub(r'^[>\s-]+', '', cell).strip()
+                            if len(cell) > 30 and not cell.startswith(('+', '=', '-')):
+                                if not re.match(r'^(Client|Duration|Brief|Role|Environment|Tech)', cell, re.IGNORECASE):
+                                    responsibilities.append(cell[:500])
                 
                 is_dup = any(
                     e.get('start_date') == start_date and
@@ -1263,10 +1374,14 @@ def extract_experiences(text: str) -> List[Dict]:
                         'start_date': start_date,
                         'end_date': end_date,
                         'duration_months': duration,
-                        'responsibilities': [],
+                        'responsibilities': responsibilities[:12],
                         'location': None,
                         'pattern': 3
                     })
+            
+            i += 5  # Skip ahead past the table we just processed
+        else:
+            i += 1
     
     # =========================================================================
     # PATTERN 1 & 5 & 6: Standard date-based extraction (fallback)
