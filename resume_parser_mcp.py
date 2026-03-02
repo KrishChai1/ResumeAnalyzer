@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.2.0"
+VERSION = "8.3.0"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -759,7 +759,7 @@ def extract_name(text: str, filename: str = "") -> Tuple[str, str, str]:
                 if not any(p.upper() in TECH_TERMS or p in TECH_TERMS for p in parts):
                     return split_name_parts(parts)
     
-    # Strategy 5: Fallback to filename
+    # Strategy 5: Fallback to filename with text search
     if filename:
         base = re.sub(r'\.(pdf|docx|doc)$', '', filename, flags=re.IGNORECASE)
         base = re.sub(r'[-_]?(Resume|CV)[-_]?\d*$', '', base, flags=re.IGNORECASE)
@@ -769,11 +769,39 @@ def extract_name(text: str, filename: str = "") -> Tuple[str, str, str]:
                          'consultant', 'sr', 'junior', 'senior', 'lead', 'gcp', 'aws',
                          'java', 'python', 'etl', 'devops', 'it', 'pm', 'scrum', 'master',
                          'project', 'snowflake', 'cloud'}
-        parts = [p.strip() for p in parts if p.strip().lower() not in non_name_parts and len(p) > 1]
-        if 2 <= len(parts) <= 4:
-            return split_name_parts([p.title() for p in parts])
+        name_parts = [p.strip() for p in parts if p.strip().lower() not in non_name_parts and len(p) > 1]
+        
+        # If we have name parts from filename, search text for full name
+        if name_parts:
+            search_term = name_parts[0].upper()  # e.g., "JAVVAJI"
+            
+            # Search entire text for lines containing this name
+            for line in lines:
+                line_upper = line.upper().strip()
+                if search_term in line_upper:
+                    # Check if this line looks like a name (2-4 uppercase words)
+                    words = line_upper.split()
+                    clean_words = [w.strip('.,;:()') for w in words if len(w) > 1]
+                    
+                    # Filter to just name-like words (all caps, no numbers, not tech terms)
+                    name_words = []
+                    for w in clean_words:
+                        if w.isalpha() and w.isupper() and len(w) >= 2:
+                            if w not in TECH_TERMS and w not in ['CONTACT', 'PROFESSIONAL', 'SUMMARY', 'SKILLS', 'EDUCATION', 'EXPERIENCE', 'TECHNICAL']:
+                                name_words.append(w)
+                    
+                    if 2 <= len(name_words) <= 4:
+                        return split_name_parts([w.title() for w in name_words])
+            
+            # If no match in text, use filename parts
+            if len(name_parts) >= 2:
+                return split_name_parts([p.title() for p in name_parts])
+            elif len(name_parts) == 1:
+                # Single name from filename
+                return name_parts[0].title(), "", ""
     
     return "", "", ""
+
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -1882,7 +1910,7 @@ Return JSON format:
                     "content-type": "application/json"
                 },
                 json={
-                    "model": "claude-sonnet-4-20250514",
+                    "model": "claude-sonnet-4-5-20250929",
                     "max_tokens": 8000,
                     "messages": [{"role": "user", "content": prompt}]
                 }
