@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║         RESUME PARSER API v7.0 - COMPLETE AGENTIC FRAMEWORK                   ║
+║         RESUME PARSER API v8.0 - COMPLETE AGENTIC FRAMEWORK                   ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                               ║
 ║  AGENTIC ARCHITECTURE:                                                        ║
@@ -16,7 +16,7 @@
 ║  │  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘   │  ║
 ║  └────────────────────────────────────────────────────────────────────────┘  ║
 ║                                                                               ║
-║  v7.0 IMPROVEMENTS:                                                           ║
+║  v8.0 IMPROVEMENTS:                                                           ║
 ║  ==================                                                           ║
 ║  • Enhanced name extraction with filename fallback                            ║
 ║  • 10 experience extraction patterns                                          ║
@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "7.0.0"
+VERSION = "8.0.0"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -161,7 +161,7 @@ for skills in SKILL_CATEGORIES.values():
     ALL_SKILLS.update(s.lower() for s in skills)
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                    ROLE-BASED SKILL INFERENCE (v7.0)                         ║
+# ║                    ROLE-BASED SKILL INFERENCE (v8.0)                         ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 ROLE_SKILL_MAP = {
@@ -249,7 +249,7 @@ Multi-agent system with specialized components:
 | **AI Enhancement Agent** | Gap filling | Claude API for missing fields |
 | **Output Agent** | Standardization | Clean JSON generation |
 
-### 📄 v7.0 Improvements
+### 📄 v8.0 Improvements
 - Enhanced name extraction with filename fallback
 - Role-based skill inference (Java Developer = Java experience)
 - Short date parsing (Jul24, Feb'20)
@@ -473,7 +473,7 @@ def normalize_text(text: str) -> str:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                        DATE PARSING UTILITIES (v7.0)                         ║
+# ║                        DATE PARSING UTILITIES (v8.0)                         ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def parse_date(text: str) -> Tuple[Optional[int], Optional[int], bool]:
@@ -527,7 +527,7 @@ def parse_date(text: str) -> Tuple[Optional[int], Optional[int], bool]:
 
 
 def parse_short_date(date_str: str) -> Tuple[Optional[int], Optional[int], bool]:
-    """Parse short date formats like Jul24, Jun21, Feb'20 (v7.0)."""
+    """Parse short date formats like Jul24, Jun21, Feb'20 (v8.0)."""
     if not date_str:
         return None, None, False
     
@@ -616,12 +616,12 @@ def extract_contact(text: str) -> Dict[str, str]:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                 EXTRACTION AGENT - NAME EXTRACTION (v7.0)                    ║
+# ║                 EXTRACTION AGENT - NAME EXTRACTION (v8.0)                    ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def extract_name(text: str, filename: str = "") -> Tuple[str, str, str]:
     """
-    Extract first, middle, last name from resume (v7.0).
+    Extract first, middle, last name from resume (v8.0).
     Enhanced with filename fallback and better tech term filtering.
     """
     lines = [l for l in text.split('\n')][:150]
@@ -754,7 +754,7 @@ def extract_name(text: str, filename: str = "") -> Tuple[str, str, str]:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║              EXTRACTION AGENT - EXPERIENCE (10 PATTERNS) v7.0                ║
+# ║              EXTRACTION AGENT - EXPERIENCE (10 PATTERNS) v8.0                ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def extract_responsibilities(lines: List[str], start_idx: int, end_idx: int) -> List[str]:
@@ -829,7 +829,7 @@ def extract_tools(lines: List[str]) -> List[str]:
 def extract_experiences(text: str) -> List[Dict]:
     """
     ╔════════════════════════════════════════════════════════════════════════════╗
-    ║                    EXTRACTION AGENT - 10 PATTERNS (v7.0)                    ║
+    ║                    EXTRACTION AGENT - 10 PATTERNS (v8.0)                    ║
     ╠════════════════════════════════════════════════════════════════════════════╣
     ║ Pattern 1: Standard "Company – Title Date" format                           ║
     ║ Pattern 2: "Worked as X in Y from A to B" format (Madhuri)                  ║
@@ -1615,7 +1615,7 @@ def extract_certifications(text: str) -> List[str]:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                     EXTRACTION AGENT - SKILLS (v7.0)                         ║
+# ║                     EXTRACTION AGENT - SKILLS (v8.0)                         ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def extract_skills(text: str) -> Dict[str, List[str]]:
@@ -1641,7 +1641,7 @@ def extract_skills(text: str) -> Dict[str, List[str]]:
 def calculate_skill_experience(text: str, experiences: List[Dict]) -> Dict[str, List[Dict]]:
     """
     Calculate skill experience months based on job mentions.
-    v7.0: Added role-based skill inference.
+    v8.0: Added role-based skill inference.
     """
     skill_months: Dict[str, int] = {}
     found_skills: Dict[str, str] = {}
@@ -1668,7 +1668,7 @@ def calculate_skill_experience(text: str, experiences: List[Dict]) -> Dict[str, 
             if re.search(rf'\b{re.escape(skill)}\b', exp_text):
                 skill_months[skill] += exp.get('duration_months', 0)
         
-        # v7.0: Role-based skill inference
+        # v8.0: Role-based skill inference
         title_lower = str(exp.get('title', '')).lower()
         for role_key, role_skills in ROLE_SKILL_MAP.items():
             if role_key in title_lower:
@@ -1744,12 +1744,12 @@ def extract_summary(text: str) -> str:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                    VALIDATION AGENT (v7.0 - Lenient)                         ║
+# ║                    VALIDATION AGENT (v8.0 - Lenient)                         ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def validation_agent(parsed: Dict, text: str) -> ValidationResult:
     """
-    Validate parsed result quality and identify issues (v7.0 - lenient scoring).
+    Validate parsed result quality and identify issues (v8.0 - lenient scoring).
     Score: 100 (perfect) to 0 (failed)
     """
     result = ValidationResult()
@@ -1993,7 +1993,7 @@ async def root():
         "redoc": "/redoc",
         "ai_validation": "enabled" if ANTHROPIC_API_KEY else "disabled",
         "supported_formats": ["pdf", "docx", "txt", "zip"],
-        "architecture": "Agentic Framework v7.0",
+        "architecture": "Agentic Framework v8.0",
         "improvements": [
             "Enhanced name extraction with filename fallback",
             "Role-based skill inference",
@@ -2127,7 +2127,7 @@ if __name__ == "__main__":
     print(f"║  AI Enhancement: {'Enabled' if ANTHROPIC_API_KEY else 'Disabled':<52}║")
     print(f"║  Docs: http://localhost:{port}/docs{' ' * 37}║")
     print("╠" + "═" * 70 + "╣")
-    print("║  v7.0 Improvements:                                                  ║")
+    print("║  v8.0 Improvements:                                                  ║")
     print("║    • Enhanced name extraction with filename fallback                 ║")
     print("║    • Role-based skill inference (Java Dev = Java experience)         ║")
     print("║    • Short date parsing (Jul24, Feb'20, May'14)                      ║")
