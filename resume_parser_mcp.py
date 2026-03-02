@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.3.0"
+VERSION = "8.3.1"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -313,72 +313,49 @@ def detect_file_type(content: bytes, filename: str) -> str:
 
 
 def extract_text_from_pdf(content: bytes) -> str:
-    """Extract text from PDF using multiple methods combined."""
-    texts = []
+    """Extract text from PDF using multiple methods."""
+    text = ""
     
-    # Method 1: pdfplumber (good for structured layouts)
+    # Try pdfplumber first
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             for page in pdf.pages:
-                # Extract main text
                 page_text = page.extract_text()
                 if page_text:
-                    texts.append(page_text)
-                
-                # Also extract from tables
-                try:
-                    tables = page.extract_tables()
-                    for table in tables:
-                        for row in table:
-                            if row:
-                                row_text = ' | '.join(str(c) if c else '' for c in row)
-                                if row_text.strip():
-                                    texts.append(row_text)
-                except:
-                    pass
+                    text += page_text + "\n"
+        if text.strip():
+            return text
     except ImportError:
         pass
     except Exception:
         pass
     
-    # Method 2: PyPDF2 (may extract different text areas including sidebars)
+    # Try PyPDF2
     try:
         from PyPDF2 import PdfReader
         reader = PdfReader(io.BytesIO(content))
         for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
-                # Only add if it contains text not already captured
-                texts.append(page_text)
+                text += page_text + "\n"
     except Exception:
         pass
     
-    # Method 3: zipfile for special PDFs (Apple exports)
-    try:
-        with zipfile.ZipFile(io.BytesIO(content)) as z:
-            text_files = sorted(
-                [n for n in z.namelist() if n.endswith('.txt')],
-                key=lambda x: int(x.split('.')[0]) if x.split('.')[0].isdigit() else 999
-            )
-            for tf in text_files:
-                texts.append(z.read(tf).decode('utf-8', errors='ignore'))
-    except:
-        pass
+    # Try zipfile method for special PDFs
+    if not text.strip():
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as z:
+                text_files = sorted(
+                    [n for n in z.namelist() if n.endswith('.txt')],
+                    key=lambda x: int(x.split('.')[0]) if x.split('.')[0].isdigit() else 999
+                )
+                for tf in text_files:
+                    text += z.read(tf).decode('utf-8', errors='ignore') + "\n"
+        except:
+            pass
     
-    # Combine all extracted text
-    combined = '\n'.join(texts)
-    
-    # Deduplicate lines while preserving order
-    seen = set()
-    unique_lines = []
-    for line in combined.split('\n'):
-        line_clean = line.strip()
-        if line_clean and line_clean not in seen:
-            seen.add(line_clean)
-            unique_lines.append(line)
-    
-    return '\n'.join(unique_lines)
+    return text
 
 
 def extract_text_from_docx(content: bytes) -> str:
@@ -759,7 +736,7 @@ def extract_name(text: str, filename: str = "") -> Tuple[str, str, str]:
                 if not any(p.upper() in TECH_TERMS or p in TECH_TERMS for p in parts):
                     return split_name_parts(parts)
     
-    # Strategy 5: Fallback to filename with text search
+    # Strategy 5: Fallback to filename
     if filename:
         base = re.sub(r'\.(pdf|docx|doc)$', '', filename, flags=re.IGNORECASE)
         base = re.sub(r'[-_]?(Resume|CV)[-_]?\d*$', '', base, flags=re.IGNORECASE)
@@ -769,39 +746,11 @@ def extract_name(text: str, filename: str = "") -> Tuple[str, str, str]:
                          'consultant', 'sr', 'junior', 'senior', 'lead', 'gcp', 'aws',
                          'java', 'python', 'etl', 'devops', 'it', 'pm', 'scrum', 'master',
                          'project', 'snowflake', 'cloud'}
-        name_parts = [p.strip() for p in parts if p.strip().lower() not in non_name_parts and len(p) > 1]
-        
-        # If we have name parts from filename, search text for full name
-        if name_parts:
-            search_term = name_parts[0].upper()  # e.g., "JAVVAJI"
-            
-            # Search entire text for lines containing this name
-            for line in lines:
-                line_upper = line.upper().strip()
-                if search_term in line_upper:
-                    # Check if this line looks like a name (2-4 uppercase words)
-                    words = line_upper.split()
-                    clean_words = [w.strip('.,;:()') for w in words if len(w) > 1]
-                    
-                    # Filter to just name-like words (all caps, no numbers, not tech terms)
-                    name_words = []
-                    for w in clean_words:
-                        if w.isalpha() and w.isupper() and len(w) >= 2:
-                            if w not in TECH_TERMS and w not in ['CONTACT', 'PROFESSIONAL', 'SUMMARY', 'SKILLS', 'EDUCATION', 'EXPERIENCE', 'TECHNICAL']:
-                                name_words.append(w)
-                    
-                    if 2 <= len(name_words) <= 4:
-                        return split_name_parts([w.title() for w in name_words])
-            
-            # If no match in text, use filename parts
-            if len(name_parts) >= 2:
-                return split_name_parts([p.title() for p in name_parts])
-            elif len(name_parts) == 1:
-                # Single name from filename
-                return name_parts[0].title(), "", ""
+        parts = [p.strip() for p in parts if p.strip().lower() not in non_name_parts and len(p) > 1]
+        if 2 <= len(parts) <= 4:
+            return split_name_parts([p.title() for p in parts])
     
     return "", "", ""
-
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -2190,10 +2139,7 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#                         DEBUG ENDPOINT (TEMPORARY)
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# DEBUG ENDPOINT
 @app.post("/debug/text", tags=["Debug"])
 async def debug_text_extraction(file: UploadFile = File(...)):
     """Debug endpoint - shows extracted text and name detection."""
@@ -2201,7 +2147,6 @@ async def debug_text_extraction(file: UploadFile = File(...)):
     text = extract_text_intelligent(content, file.filename)
     lines = text.split('\n')
     
-    # Find ALL-CAPS lines (Strategy 3)
     all_caps_lines = []
     for i, line in enumerate(lines):
         clean = ' '.join(line.split()).strip('\r')
@@ -2210,7 +2155,6 @@ async def debug_text_extraction(file: UploadFile = File(...)):
             if 2 <= len(parts) <= 4:
                 all_caps_lines.append({"line_num": i, "text": clean, "parts": parts})
     
-    # Test name extraction
     first, middle, last = extract_name(text, file.filename)
     
     return {
@@ -2219,10 +2163,5 @@ async def debug_text_extraction(file: UploadFile = File(...)):
         "line_count": len(lines),
         "first_20_lines": [l.strip()[:80] for l in lines[:20]],
         "all_caps_candidates": all_caps_lines[:10],
-        "extracted_name": {
-            "first": first,
-            "middle": middle,
-            "last": last,
-            "full": ' '.join(filter(None, [first, middle, last]))
-        }
+        "extracted_name": {"first": first, "middle": middle, "last": last, "full": ' '.join(filter(None, [first, middle, last]))}
     }
