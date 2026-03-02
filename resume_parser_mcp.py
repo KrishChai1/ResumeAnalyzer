@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║         RESUME PARSER API v8.0 - COMPLETE AGENTIC FRAMEWORK                   ║
+║       RESUME PARSER API KRISH v8.0 - COMPLETE AGENTIC FRAMEWORK              ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                               ║
 ║  AGENTIC ARCHITECTURE:                                                        ║
