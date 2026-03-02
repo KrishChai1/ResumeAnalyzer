@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║       RESUME PARSER API KRISH v8.0 - COMPLETE AGENTIC FRAMEWORK              ║
+║         RESUME PARSER API v8.0 - COMPLETE AGENTIC FRAMEWORK                   ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                               ║
 ║  AGENTIC ARCHITECTURE:                                                        ║
@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.0.0"
+VERSION = "8.1.0"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -693,7 +693,7 @@ def extract_name(text: str, filename: str = "") -> Tuple[str, str, str]:
                     return split_name_parts([p.title() if p.isupper() else p for p in parts])
     
     # Strategy 3: ALL-CAPS name line (PDF sidebars)
-    for line in lines[:100]:
+    for line in lines:  # Search entire text for ALL-CAPS name
         clean_line = ' '.join(line.split()).strip('\r')
         if clean_line.isupper() and 5 < len(clean_line) < 40:
             parts = clean_line.split()
@@ -2121,7 +2121,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     
     print("╔" + "═" * 70 + "╗")
-    print(f"║{'RESUME PARSER KRISH API v' + VERSION + ' - Enterprise Agentic Framework':^70}║")
+    print(f"║{'RESUME PARSER API v' + VERSION + ' - Enterprise Agentic Framework':^70}║")
     print("╠" + "═" * 70 + "╣")
     print(f"║  Port: {port:<62}║")
     print(f"║  AI Enhancement: {'Enabled' if ANTHROPIC_API_KEY else 'Disabled':<52}║")
