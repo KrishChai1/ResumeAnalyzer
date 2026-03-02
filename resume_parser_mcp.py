@@ -2121,7 +2121,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     
     print("╔" + "═" * 70 + "╗")
-    print(f"║{'RESUME PARSER API Krisg v' + VERSION + ' - Enterprise Agentic Framework':^70}║")
+    print(f"║{'RESUME PARSER API KRISH v' + VERSION + ' - Enterprise Agentic Framework':^70}║")
     print("╠" + "═" * 70 + "╣")
     print(f"║  Port: {port:<62}║")
     print(f"║  AI Enhancement: {'Enabled' if ANTHROPIC_API_KEY else 'Disabled':<52}║")
