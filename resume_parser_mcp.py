@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.1.0"
+VERSION = "8.1.1"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -2137,3 +2137,41 @@ if __name__ == "__main__":
     print("╚" + "═" * 70 + "╝")
     
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                         DEBUG ENDPOINT (TEMPORARY)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/debug/text", tags=["Debug"])
+async def debug_text_extraction(file: UploadFile = File(...)):
+    """Debug endpoint - shows extracted text and name detection."""
+    content = await file.read()
+    text = extract_text_intelligent(content, file.filename)
+    lines = text.split('\n')
+    
+    # Find ALL-CAPS lines (Strategy 3)
+    all_caps_lines = []
+    for i, line in enumerate(lines):
+        clean = ' '.join(line.split()).strip('\r')
+        if clean.isupper() and 5 < len(clean) < 40:
+            parts = clean.split()
+            if 2 <= len(parts) <= 4:
+                all_caps_lines.append({"line_num": i, "text": clean, "parts": parts})
+    
+    # Test name extraction
+    first, middle, last = extract_name(text, file.filename)
+    
+    return {
+        "filename": file.filename,
+        "text_length": len(text),
+        "line_count": len(lines),
+        "first_20_lines": [l.strip()[:80] for l in lines[:20]],
+        "all_caps_candidates": all_caps_lines[:10],
+        "extracted_name": {
+            "first": first,
+            "middle": middle,
+            "last": last,
+            "full": ' '.join(filter(None, [first, middle, last]))
+        }
+    }
