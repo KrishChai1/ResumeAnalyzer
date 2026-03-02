@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.3.1"
+VERSION = "8.3.2"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -1860,7 +1860,7 @@ Return JSON format:
                 },
                 json={
                     "model": "claude-sonnet-4-5-20250929",
-                    "max_tokens": 8000,
+                    "max_tokens": 4096,
                     "messages": [{"role": "user", "content": prompt}]
                 }
             )
@@ -1890,7 +1890,7 @@ Return JSON format:
                     parsed['ai_enhanced'] = True
                     parsed['ai_fields_fixed'] = missing
             else:
-                parsed['ai_error'] = f"API returned {response.status_code}"
+                parsed['ai_error'] = f"API {response.status_code}: {response.text[:200]}"
                     
     except Exception as e:
         parsed['ai_error'] = str(e)
