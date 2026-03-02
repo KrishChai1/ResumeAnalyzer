@@ -17,7 +17,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     
     print(f"\n{'='*60}")
-    print(f"RESUME PARSER API v{VERSION}")
+    print(f"RESUME PARSER KRISH API v{VERSION}")
     print(f"AI Model: {AI_MODEL if 'AI_MODEL' in dir() else 'claude-sonnet-4-20250514'}")
     print(f"AI Ready: {'Yes' if ANTHROPIC_API_KEY else 'No - Set ANTHROPIC_API_KEY'}")
     print(f"Docs: http://localhost:{port}/docs")
