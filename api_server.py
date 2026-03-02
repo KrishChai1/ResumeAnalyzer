@@ -1,143 +1,26 @@
+#!/usr/bin/env python3
 """
-Resume Parser API Server
-========================
-FastAPI server for resume parsing with Swagger UI.
+Resume Parser API Server v8.0.0
+Main entry point for Railway deployment
 """
 
-import os
-import asyncio
-from typing import Optional
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+# Import everything from the parser module
+from resume_parser_mcp import *
 
-from resume_parser_mcp import (
-    parse_resume_full, ParseResumeInput, ResponseFormat,
-    extract_technical_skills, normalize_text, ANTHROPIC_API_KEY,
-    extract_text_intelligent, detect_file_type
-)
-
-app = FastAPI(
-    title="Resume Parser API",
-    description="""
-## Production-Grade Resume Parser with AI Validation
-
-### Features:
-- Multi-format: PDF, DOCX, TXT
-- Intelligent extraction: Name, contact, education, experience, skills
-- Skill categorization with experience months
-- Optional Claude AI validation
-
-### Configuration:
-Set `ANTHROPIC_API_KEY` environment variable for AI enhancement.
-    """,
-    version="2.0.0",
-    docs_url="/docs"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-class ParseTextRequest(BaseModel):
-    text: str = Field(..., min_length=50)
-    use_ai_validation: bool = Field(default=True)
-    filename: Optional[str] = Field(default=None)
-
-
-class ExtractSkillsRequest(BaseModel):
-    text: str = Field(..., min_length=10)
-
-
-@app.get("/", tags=["Info"])
-async def root():
-    return {
-        "name": "Resume Parser API",
-        "version": "2.0.0",
-        "docs": "/docs",
-        "ai_validation": "enabled" if ANTHROPIC_API_KEY else "disabled"
-    }
-
-
-@app.get("/health", tags=["Health"])
-async def health_check():
-    return {"status": "healthy", "ai_available": bool(ANTHROPIC_API_KEY)}
-
-
-@app.post("/parse/file", tags=["Parsing"])
-async def parse_file(
-    file: UploadFile = File(...),
-    use_ai_validation: bool = Form(default=True)
-):
-    """Parse resume from PDF/Word/TXT file."""
-    if not file.filename:
-        raise HTTPException(400, "No file provided")
-    
-    ext = file.filename.lower().split('.')[-1]
-    if ext not in ['pdf', 'docx', 'doc', 'txt']:
-        raise HTTPException(400, f"Unsupported format: {ext}")
-    
-    try:
-        content = await file.read()
-        
-        if len(content) == 0:
-            raise HTTPException(400, "Empty file uploaded")
-        
-        # Use intelligent extraction (handles PDF, DOCX tables/textboxes, TXT)
-        text = extract_text_intelligent(content, file.filename)
-        
-        if len(text.strip()) < 50:
-            file_type = detect_file_type(content, file.filename)
-            raise HTTPException(
-                400,
-                f"Insufficient text extracted ({len(text.strip())} chars). "
-                f"Detected type: {file_type}. "
-                f"Try uploading a different format or paste the text directly via /parse."
-            )
-        
-        result = await parse_resume_full(ParseResumeInput(
-            resume_text=text,
-            filename=file.filename,
-            use_ai_validation=use_ai_validation
-        ))
-        
-        import json
-        return json.loads(result)
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"Error processing file: {str(e)}")
-
-
-@app.post("/parse", tags=["Parsing"])
-async def parse_text(request: ParseTextRequest):
-    """Parse resume from text."""
-    try:
-        result = await parse_resume_full(ParseResumeInput(
-            resume_text=request.text,
-            filename=request.filename,
-            use_ai_validation=request.use_ai_validation
-        ))
-        import json
-        return json.loads(result)
-    except Exception as e:
-        raise HTTPException(500, f"Error: {str(e)}")
-
-
-@app.post("/extract/skills", tags=["Utilities"])
-async def extract_skills(request: ExtractSkillsRequest):
-    """Extract technical skills from text."""
-    skills = extract_technical_skills(request.text)
-    return {"skills": skills, "count": len(skills)}
-
+# This file just imports and runs the FastAPI app from resume_parser_mcp.py
+# The app, routes, and all logic are in resume_parser_mcp.py
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    import os
+    
+    port = int(os.environ.get("PORT", 8080))
+    
+    print(f"\n{'='*60}")
+    print(f"RESUME PARSER API v{VERSION}")
+    print(f"AI Model: {AI_MODEL if 'AI_MODEL' in dir() else 'claude-sonnet-4-20250514'}")
+    print(f"AI Ready: {'Yes' if ANTHROPIC_API_KEY else 'No - Set ANTHROPIC_API_KEY'}")
+    print(f"Docs: http://localhost:{port}/docs")
+    print(f"{'='*60}\n")
+    
     uvicorn.run(app, host="0.0.0.0", port=port)
