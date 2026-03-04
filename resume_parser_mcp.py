@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.3.2"
+VERSION = "8.4.0"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -693,7 +693,7 @@ def extract_name(text: str, filename: str = "") -> Tuple[str, str, str]:
                     return split_name_parts([p.title() if p.isupper() else p for p in parts])
     
     # Strategy 3: ALL-CAPS name line (PDF sidebars)
-    for line in lines:  # Search entire text for ALL-CAPS name
+    for line in lines:  # Search entire text
         clean_line = ' '.join(line.split()).strip('\r')
         if clean_line.isupper() and 5 < len(clean_line) < 40:
             parts = clean_line.split()
@@ -1806,7 +1806,7 @@ def validation_agent(parsed: Dict, text: str) -> ValidationResult:
         result.missing_fields.append("name")
         result.score -= 20
     
-    result.needs_ai_enhancement = result.score < 50 or "missing_name" in result.issues or "invalid_name" in result.issues
+    result.needs_ai_enhancement = result.score < 50 or "missing_name" in result.issues or "invalid_name" in result.issues or "low_responsibilities" in result.issues
     result.score = max(0, result.score)
     
     return result
@@ -1818,8 +1818,8 @@ def validation_agent(parsed: Dict, text: str) -> ValidationResult:
 
 async def ai_enhancement_agent(text: str, parsed: Dict, validation: ValidationResult) -> Dict:
     """
-    Use Claude API to extract/fix missing fields.
-    Only called when validation score is low or critical fields missing.
+    Use Claude API to extract/fix missing fields including responsibilities.
+    Triggered when validation score is low, name missing, or responsibilities low.
     """
     if not ANTHROPIC_API_KEY:
         parsed["ai_skipped"] = "No API key configured"
@@ -1828,9 +1828,45 @@ async def ai_enhancement_agent(text: str, parsed: Dict, validation: ValidationRe
     try:
         import httpx
         
+        pr = parsed.get("parsed_resume", {})
         missing = list(set(validation.missing_fields))
+        issues = validation.issues
         
-        prompt = f"""You are a resume parsing expert. Extract these MISSING fields from this resume.
+        # Check if we need to extract responsibilities
+        needs_responsibilities = "low_responsibilities" in issues
+        existing_jobs = pr.get("experience", [])
+        
+        # Build prompt based on what's needed
+        if needs_responsibilities and existing_jobs:
+            # We have jobs but no responsibilities - ask AI to extract them
+            job_list = "\n".join([f"- {j.get('Employer', 'Unknown')}: {j.get('title', 'Unknown')}" for j in existing_jobs])
+            
+            prompt = f"""You are a resume parsing expert. Extract the candidate's name and job responsibilities from this resume.
+
+EXISTING JOBS FOUND:
+{job_list}
+
+For EACH job above, extract 5-15 bullet point responsibilities from the resume text.
+
+RESUME TEXT:
+{text[:15000]}
+
+Return ONLY valid JSON, no markdown:
+{{
+  "firstname": "First name from resume",
+  "lastname": "Last name from resume",
+  "name": "Full Name",
+  "certifications": ["cert1", "cert2"],
+  "jobs": [
+    {{
+      "employer": "Company Name (match exactly from list above)",
+      "responsibilities": ["responsibility 1", "responsibility 2", ...]
+    }}
+  ]
+}}"""
+        else:
+            # Standard extraction for missing fields
+            prompt = f"""You are a resume parsing expert. Extract these MISSING fields from this resume.
 Return ONLY valid JSON with the requested fields, no markdown or explanation.
 
 MISSING FIELDS: {', '.join(missing)}
@@ -1846,6 +1882,7 @@ Return JSON format:
   "email": "email@example.com",
   "phone": "+1234567890",
   "title": "Professional Title",
+  "certifications": ["cert1", "cert2"],
   "education": [{{"degree": "...", "institution": "...", "year": "YYYY"}}],
   "experience": [{{"Employer": "Company", "title": "Job Title", "start_date": "YYYY-MM", "end_date": "YYYY-MM", "duration_months": N, "responsibilities": ["..."]}}]
 }}"""
@@ -1871,24 +1908,57 @@ Return JSON format:
                 
                 if json_match:
                     ai_data = json.loads(json_match.group())
-                    pr = parsed.get("parsed_resume", {})
                     
+                    # Extract name fields
                     for key in ['firstname', 'lastname', 'name', 'email', 'title']:
-                        if key in missing and ai_data.get(key):
+                        if ai_data.get(key) and not pr.get(key):
                             pr[key] = ai_data[key]
                     
-                    if 'phone' in missing and ai_data.get('phone'):
+                    # Split name into first/last if we got full name
+                    if ai_data.get('name') and not pr.get('firstname'):
+                        name_parts = ai_data['name'].split()
+                        if len(name_parts) >= 2:
+                            pr['firstname'] = name_parts[0]
+                            pr['lastname'] = name_parts[-1]
+                    
+                    if ai_data.get('phone') and not pr.get('phone_number'):
                         pr['phone_number'] = ai_data['phone']
                     
-                    if 'education' in missing and ai_data.get('education'):
+                    # Handle certifications
+                    if ai_data.get('certifications'):
+                        existing_certs = pr.get('certifications', [])
+                        new_certs = ai_data['certifications']
+                        if isinstance(new_certs, list) and len(new_certs) > len(existing_certs):
+                            pr['certifications'] = new_certs
+                    
+                    if ai_data.get('education') and not pr.get('education'):
                         pr['education'] = ai_data['education']
                     
-                    if 'experience' in missing and ai_data.get('experience'):
-                        if not pr.get('experience'):
-                            pr['experience'] = ai_data['experience']
+                    # Merge responsibilities into existing jobs
+                    if ai_data.get('jobs') and existing_jobs:
+                        ai_jobs = ai_data['jobs']
+                        for existing_job in existing_jobs:
+                            employer = existing_job.get('Employer', '').lower()
+                            for ai_job in ai_jobs:
+                                ai_employer = ai_job.get('employer', '').lower()
+                                # Match by employer name (fuzzy)
+                                if employer and ai_employer:
+                                    if employer in ai_employer or ai_employer in employer or \
+                                       any(word in ai_employer for word in employer.split() if len(word) > 3):
+                                        if ai_job.get('responsibilities') and not existing_job.get('responsibilities'):
+                                            existing_job['responsibilities'] = ai_job['responsibilities']
+                                            break
+                    
+                    # If AI returned full experience and we had none
+                    if ai_data.get('experience') and not existing_jobs:
+                        pr['experience'] = ai_data['experience']
+                    
+                    fixed_fields = missing.copy()
+                    if needs_responsibilities:
+                        fixed_fields.append('responsibilities')
                     
                     parsed['ai_enhanced'] = True
-                    parsed['ai_fields_fixed'] = missing
+                    parsed['ai_fields_fixed'] = fixed_fields
             else:
                 parsed['ai_error'] = f"API {response.status_code}: {response.text[:200]}"
                     
