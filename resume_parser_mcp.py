@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.4.0"
+VERSION = "8.5.0"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -359,18 +359,14 @@ def extract_text_from_pdf(content: bytes) -> str:
 
 
 def extract_text_from_docx(content: bytes) -> str:
-    """Extract text from DOCX including tables and text boxes."""
+    """Extract text from DOCX including tables and text boxes (v8.4.1)."""
     try:
         from docx import Document
         doc = Document(io.BytesIO(content))
         
         all_text = []
         
-        for para in doc.paragraphs:
-            text = para.text.strip()
-            if text:
-                all_text.append(text)
-        
+        # Extract tables FIRST (often contain name/header info)
         for table in doc.tables:
             for row in table.rows:
                 row_text = []
@@ -380,6 +376,12 @@ def extract_text_from_docx(content: bytes) -> str:
                         row_text.append(cell_text)
                 if row_text:
                     all_text.append(' | '.join(row_text))
+        
+        # Then extract paragraphs
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if text:
+                all_text.append(text)
         
         # Try to extract text boxes
         try:
@@ -758,17 +760,27 @@ def extract_name(text: str, filename: str = "") -> Tuple[str, str, str]:
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def extract_responsibilities(lines: List[str], start_idx: int, end_idx: int) -> List[str]:
-    """Extract responsibilities from lines (helper function)."""
+    """Extract responsibilities from lines (v8.4.1 - handles plain text)."""
     responsibilities = []
     current_resp = ""
-    bullet_only_line = False  # Track if previous line was just a bullet
+    bullet_only_line = False
+    after_resp_header = False  # Track if we're after "Responsibilities:" header
     
     for i in range(start_idx, min(end_idx, len(lines))):
         line = lines[i]
         stripped = line.strip().rstrip('\r')
         
+        # Skip "Responsibilities:" header
+        if re.match(r'^Responsibilities\s*:?\s*$', stripped, re.IGNORECASE):
+            after_resp_header = True
+            continue
+        
         # Stop at section headers
         if re.match(r'^(EDUCATION|TECHNICAL|SKILLS|CERTIFICATIONS|PERSONAL|EXPERIENCE\s*$)', stripped, re.IGNORECASE):
+            break
+        
+        # Stop at next experience (pipe format)
+        if re.match(r'^[A-Za-z][^|]*\|[^|]*\|.*\d{4}', stripped):
             break
         
         # Stop at next experience (date pattern)
@@ -777,9 +789,8 @@ def extract_responsibilities(lines: List[str], start_idx: int, end_idx: int) -> 
         if re.match(r'^\d{1,2}/\d{4}\s*[-–]', stripped):
             break
         
-        # Check for standalone bullet (Javvaji PDF pattern: "■\r" on its own line)
+        # Check for standalone bullet
         if stripped in ('■', '•', '-', '*', '>'):
-            # Save current responsibility if exists
             if current_resp and len(current_resp) > 20:
                 responsibilities.append(current_resp.strip()[:500])
             current_resp = ""
@@ -792,13 +803,18 @@ def extract_responsibilities(lines: List[str], start_idx: int, end_idx: int) -> 
                 responsibilities.append(current_resp.strip()[:500])
             current_resp = re.sub(r'^[■•\-\*>\d.]+\s*', '', stripped)
             bullet_only_line = False
+            after_resp_header = True
+        # Plain text line after "Responsibilities:" header (Steven format)
+        elif after_resp_header and stripped and len(stripped) > 30:
+            if current_resp and len(current_resp) > 20:
+                responsibilities.append(current_resp.strip()[:500])
+            current_resp = stripped
         # Text following a standalone bullet
         elif bullet_only_line and stripped:
             current_resp = stripped
             bullet_only_line = False
-        # Continuation (indented line or continuation text)
+        # Continuation
         elif current_resp and stripped:
-            # Check if it's a continuation (doesn't start with uppercase or is indented)
             if line.startswith('    ') or line.startswith('\t') or not stripped[0].isupper() or len(stripped) < 60:
                 current_resp += ' ' + stripped
         # Blank line - save current
@@ -1116,7 +1132,7 @@ def extract_experiences(text: str) -> List[Dict]:
     # =========================================================================
     # PATTERN 10: "## Title | Company, Location | Date" (Steven markdown)
     # =========================================================================
-    steven_pattern = r'^\s*##\s*(.+?)\s*\|\s*([^|,]+)(?:,\s*([^|]+))?\s*\|\s*((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})\s*[-–]+\s*((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|Present|Current)'
+    steven_pattern = r'^\s*(?:##\s*)?(.+?)\s*\|\s*([^|,]+)(?:,\s*([^|]+))?\s*\|\s*((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})\s*[-–]+\s*((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|Present|Current)'
     
     for i, line in enumerate(lines):
         match = re.match(steven_pattern, line.strip(), re.IGNORECASE)
@@ -1536,7 +1552,11 @@ def extract_education(text: str) -> List[Dict]:
         lines = [l.strip() for l in edu_section.split('\n') if l.strip()]
         
         for line in lines:
-            if re.match(r'^(Worked|Working|•|-|\*|PROFESSIONAL)', line, re.IGNORECASE):
+            # Strip bullet points
+            line = re.sub(r'^[•·\-\*]\s*', '', line).strip()
+            if not line:
+                continue
+            if re.match(r'^(Worked|Working|PROFESSIONAL)', line, re.IGNORECASE):
                 continue
             
             entry = {}
@@ -1544,9 +1564,16 @@ def extract_education(text: str) -> List[Dict]:
             if line.count('|') >= 2:
                 parts = [p.strip() for p in line.split('|')]
                 entry['degree'] = parts[0]
-                entry['institution'] = parts[1]
-                year_match = re.search(r'(\d{4})', parts[-1])
-                entry['year'] = year_match.group(1) if year_match else None
+                # Find year and institution - year is typically in middle, institution at end
+                entry['institution'] = parts[-1] if not re.match(r'^\d{4}$', parts[-1].strip()) else None
+                for p in parts[1:]:
+                    year_match = re.search(r'(\d{4})', p)
+                    if year_match:
+                        entry['year'] = year_match.group(1)
+                        # If institution not set and this isn't the year-only part
+                        if not entry.get('institution') and len(parts) >= 3:
+                            entry['institution'] = parts[-1]
+                        break
             
             elif '|' in line and ('–' in line or '-' in line):
                 dash_match = re.match(r'^(.+?)\s*[-–]\s*(.+?)\s*\|\s*(\d{4})\s*[-–]\s*(\d{4})', line)
@@ -1598,7 +1625,7 @@ def extract_certifications(text: str) -> List[str]:
     certifications = []
     
     cert_match = re.search(
-        r'CERTIFICATIONS?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nEDUCATION|\nSKILLS|\Z)',
+        r'CERTIFICATIONS?(?:\s*/\s*TRAININGS?)?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nEDUCATION|\nSKILLS|\nTOOLS|\Z)',
         text, re.IGNORECASE | re.DOTALL
     )
     
@@ -1744,82 +1771,256 @@ def extract_summary(text: str) -> str:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                    VALIDATION AGENT (v8.0 - Lenient)                         ║
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║              VALIDATION AGENT (v8.5 - Comprehensive Rules)                   ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
+
+"""
+VALIDATION RULES:
+═══════════════════════════════════════════════════════════════════════════════
+
+CRITICAL FIELDS (must have):
+  1. name         - Full name, 2+ chars, not a job title/skill
+  2. email        - Valid email format with @
+  3. experience   - At least 1 job entry
+
+IMPORTANT FIELDS (should have):
+  4. phone        - Phone number
+  5. title        - Current/recent job title
+  6. firstname    - First name extracted
+  7. lastname     - Last name extracted
+
+EXPERIENCE QUALITY:
+  8. Each job should have: Employer, title, start_date, end_date
+  9. Each job should have: 3+ responsibilities
+  10. Dates should be valid (start < end)
+
+EDUCATION:
+  11. At least 1 education entry (degree + institution)
+  12. Year should be numeric 4 digits
+
+SKILLS:
+  13. At least 5 technical skills extracted
+
+CERTIFICATIONS:
+  14. Extract if present in resume
+
+LOCATION:
+  15. Extract city/state if present
+
+AI ENHANCEMENT TRIGGERS:
+- Any CRITICAL field missing → AI
+- Score < 70 → AI
+- Low responsibilities (< 5 total) → AI
+- Missing education when text mentions degree → AI
+- Missing certifications when text mentions "certified" → AI
+"""
 
 def validation_agent(parsed: Dict, text: str) -> ValidationResult:
     """
-    Validate parsed result quality and identify issues (v8.0 - lenient scoring).
-    Score: 100 (perfect) to 0 (failed)
+    Comprehensive validation with detailed rules (v8.5).
+    Triggers AI enhancement for any significant gaps.
     """
     result = ValidationResult()
     pr = parsed.get("parsed_resume", {})
+    text_lower = text.lower()
     
-    # Critical checks (15 points each)
-    critical = [
-        ("name", pr.get("name") and len(pr.get("name", "")) > 2),
-        ("email", bool(pr.get("email") and "@" in pr.get("email", ""))),
-        ("experience", len(pr.get("experience", [])) > 0),
-    ]
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CRITICAL CHECKS (15 points each)
+    # ═══════════════════════════════════════════════════════════════════════════
     
-    for field, passed in critical:
-        if not passed:
-            result.issues.append(f"missing_{field}")
-            result.missing_fields.append(field)
+    # 1. Name validation
+    name = pr.get("name", "") or ""
+    if not name or len(name) < 3:
+        result.issues.append("missing_name")
+        result.missing_fields.append("name")
+        result.score -= 15
+    else:
+        # Check for invalid names (job titles, skills, etc.)
+        invalid_names = [
+            "sql server", "data engineer", "project manager", "key expertise", 
+            "professional", "technical", "summary", "experience", "education",
+            "developer", "analyst", "consultant", "manager", "engineer",
+            "skills", "certification", "objective", "resume", "curriculum"
+        ]
+        name_lower = name.lower()
+        if any(inv in name_lower for inv in invalid_names) and len(name.split()) < 2:
+            result.issues.append("invalid_name")
+            result.missing_fields.append("name")
             result.score -= 15
     
-    # Important checks (8 points each)
-    important = [
-        ("phone", bool(pr.get("phone_number"))),
-        ("title", bool(pr.get("title"))),
-    ]
+    # 2. Email validation
+    email = pr.get("email", "") or ""
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        result.issues.append("missing_email")
+        result.missing_fields.append("email")
+        result.score -= 15
     
-    for field, passed in important:
-        if not passed:
-            result.issues.append(f"missing_{field}")
-            result.missing_fields.append(field)
-            result.score -= 8
-    
-    # Experience quality (limited penalty)
+    # 3. Experience validation
     experiences = pr.get("experience", [])
+    if not experiences:
+        result.issues.append("missing_experience")
+        result.missing_fields.append("experience")
+        result.score -= 15
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # IMPORTANT CHECKS (8 points each)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    # 4. Phone validation
+    if not pr.get("phone_number"):
+        result.issues.append("missing_phone")
+        result.missing_fields.append("phone")
+        result.score -= 8
+    
+    # 5. Title validation
+    if not pr.get("title"):
+        result.issues.append("missing_title")
+        result.missing_fields.append("title")
+        result.score -= 8
+    
+    # 6-7. First/Last name validation
+    if not pr.get("firstname"):
+        result.issues.append("missing_firstname")
+        result.missing_fields.append("firstname")
+        result.score -= 3
+    
+    if not pr.get("lastname"):
+        result.issues.append("missing_lastname")
+        result.missing_fields.append("lastname")
+        result.score -= 3
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # EXPERIENCE QUALITY (up to 20 points)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
     if experiences:
         total_resp = sum(len(e.get("responsibilities", [])) for e in experiences)
-        if total_resp < 3:
-            result.issues.append("low_responsibilities")
-            result.score -= 10
+        jobs_without_employer = sum(1 for e in experiences if not e.get("Employer"))
+        jobs_without_title = sum(1 for e in experiences if not e.get("title"))
+        jobs_without_dates = sum(1 for e in experiences if not e.get("start_date"))
+        jobs_without_resp = sum(1 for e in experiences if not e.get("responsibilities"))
         
-        # Only penalize first 3 missing titles/employers
-        missing_count = 0
-        for e in experiences[:5]:
-            if not e.get("title") and missing_count < 3:
-                missing_count += 1
-                result.score -= 3
-            if not e.get("Employer") and missing_count < 3:
-                missing_count += 1
-                result.score -= 3
+        # 9. Responsibilities check
+        if total_resp < 5:
+            result.issues.append("low_responsibilities")
+            result.missing_fields.append("responsibilities")
+            result.score -= 10
+        elif total_resp < 10:
+            result.issues.append("few_responsibilities")
+            result.score -= 5
+        
+        # 8. Job details check
+        if jobs_without_employer > len(experiences) // 2:
+            result.issues.append("missing_employers")
+            result.score -= 5
+        
+        if jobs_without_title > len(experiences) // 2:
+            result.issues.append("missing_job_titles")
+            result.score -= 5
+        
+        if jobs_without_dates > len(experiences) // 2:
+            result.issues.append("missing_dates")
+            result.score -= 3
     
-    # Name sanity check
-    name = (pr.get("name") or "").lower()
-    invalid = ["sql server", "data engineer", "project manager", "key expertise", "professional", "technical"]
-    if any(inv in name for inv in invalid):
-        result.issues.append("invalid_name")
-        result.missing_fields.append("name")
-        result.score -= 20
+    # ═══════════════════════════════════════════════════════════════════════════
+    # EDUCATION CHECK (5 points)
+    # ═══════════════════════════════════════════════════════════════════════════
     
-    result.needs_ai_enhancement = result.score < 50 or "missing_name" in result.issues or "invalid_name" in result.issues or "low_responsibilities" in result.issues
+    education = pr.get("education", [])
+    education_keywords = ["bachelor", "master", "mba", "phd", "degree", "university", "college", "b.tech", "m.tech"]
+    text_has_education = any(kw in text_lower for kw in education_keywords)
+    
+    if not education and text_has_education:
+        result.issues.append("missing_education")
+        result.missing_fields.append("education")
+        result.score -= 5
+    elif education:
+        # Check education quality
+        for edu in education:
+            if not edu.get("institution"):
+                result.issues.append("education_missing_institution")
+                result.missing_fields.append("education")
+                result.score -= 2
+                break
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CERTIFICATIONS CHECK (3 points)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    certifications = pr.get("certifications", [])
+    cert_keywords = ["certified", "certification", "certificate", "aws certified", "pmp", "scrum master", "cissp"]
+    text_has_certs = any(kw in text_lower for kw in cert_keywords)
+    
+    if not certifications and text_has_certs:
+        result.issues.append("missing_certifications")
+        result.missing_fields.append("certifications")
+        result.score -= 3
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # LOCATION CHECK (2 points)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    location = pr.get("location")
+    location_patterns = ["tx", "ca", "ny", "fl", "usa", "india", "uk", "houston", "dallas", "new york", "bangalore"]
+    text_has_location = any(loc in text_lower for loc in location_patterns)
+    
+    if not location and text_has_location:
+        result.issues.append("missing_location")
+        result.missing_fields.append("location")
+        result.score -= 2
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SKILLS CHECK (3 points)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    skills = pr.get("technical_skills", [])
+    if len(skills) < 5:
+        result.issues.append("few_skills")
+        result.score -= 3
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # AI ENHANCEMENT DECISION
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    # Trigger AI if:
+    # - Any critical field missing (name, email, experience)
+    # - Score below 70
+    # - Low responsibilities
+    # - Missing education/certs when text suggests they exist
+    
+    critical_missing = any(issue in result.issues for issue in [
+        "missing_name", "invalid_name", "missing_email", "missing_experience"
+    ])
+    
+    quality_issues = any(issue in result.issues for issue in [
+        "low_responsibilities", "missing_employers", "missing_job_titles"
+    ])
+    
+    content_gaps = any(issue in result.issues for issue in [
+        "missing_education", "missing_certifications", "missing_location"
+    ])
+    
+    result.needs_ai_enhancement = (
+        critical_missing or 
+        quality_issues or 
+        content_gaps or 
+        result.score < 70
+    )
+    
     result.score = max(0, result.score)
     
     return result
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                        AI ENHANCEMENT AGENT                                  ║
+# ║                    AI ENHANCEMENT AGENT (v8.5 - Comprehensive)               ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 async def ai_enhancement_agent(text: str, parsed: Dict, validation: ValidationResult) -> Dict:
     """
-    Use Claude API to extract/fix missing fields including responsibilities.
-    Triggered when validation score is low, name missing, or responsibilities low.
+    Use Claude API to extract/fix ALL missing or low-quality fields.
+    Comprehensive extraction for any validation failures (v8.5).
     """
     if not ANTHROPIC_API_KEY:
         parsed["ai_skipped"] = "No API key configured"
@@ -1832,62 +2033,68 @@ async def ai_enhancement_agent(text: str, parsed: Dict, validation: ValidationRe
         missing = list(set(validation.missing_fields))
         issues = validation.issues
         
-        # Check if we need to extract responsibilities
-        needs_responsibilities = "low_responsibilities" in issues
+        # Build comprehensive prompt based on what's needed
         existing_jobs = pr.get("experience", [])
+        job_list = ""
+        if existing_jobs:
+            job_list = "EXISTING JOBS FOUND:\n" + "\n".join([
+                f"- {j.get('Employer', 'Unknown')}: {j.get('title', 'Unknown')} ({j.get('start_date', '?')} - {j.get('end_date', '?')})" 
+                for j in existing_jobs
+            ])
         
-        # Build prompt based on what's needed
-        if needs_responsibilities and existing_jobs:
-            # We have jobs but no responsibilities - ask AI to extract them
-            job_list = "\n".join([f"- {j.get('Employer', 'Unknown')}: {j.get('title', 'Unknown')}" for j in existing_jobs])
-            
-            prompt = f"""You are a resume parsing expert. Extract the candidate's name and job responsibilities from this resume.
+        # Determine what needs extraction
+        needs_name = "name" in missing or "firstname" in missing or "lastname" in missing
+        needs_contact = "email" in missing or "phone" in missing or "location" in missing
+        needs_responsibilities = "responsibilities" in missing or "low_responsibilities" in issues
+        needs_education = "education" in missing
+        needs_certifications = "certifications" in missing
+        needs_experience = "experience" in missing or "missing_employers" in issues
+        
+        prompt = f"""You are an expert resume parser. Extract the following MISSING information from this resume.
+Return ONLY valid JSON with no markdown formatting or explanation.
 
-EXISTING JOBS FOUND:
+FIELDS TO EXTRACT: {', '.join(missing) if missing else 'Validate and enhance all fields'}
+
+ISSUES DETECTED: {', '.join(issues) if issues else 'None'}
+
 {job_list}
 
-For EACH job above, extract 5-15 bullet point responsibilities from the resume text.
-
 RESUME TEXT:
 {text[:15000]}
 
-Return ONLY valid JSON, no markdown:
-{{
-  "firstname": "First name from resume",
-  "lastname": "Last name from resume",
-  "name": "Full Name",
-  "certifications": ["cert1", "cert2"],
-  "jobs": [
-    {{
-      "employer": "Company Name (match exactly from list above)",
-      "responsibilities": ["responsibility 1", "responsibility 2", ...]
-    }}
-  ]
-}}"""
-        else:
-            # Standard extraction for missing fields
-            prompt = f"""You are a resume parsing expert. Extract these MISSING fields from this resume.
-Return ONLY valid JSON with the requested fields, no markdown or explanation.
-
-MISSING FIELDS: {', '.join(missing)}
-
-RESUME TEXT:
-{text[:15000]}
-
-Return JSON format:
+Return this exact JSON structure (include ALL fields, use null if not found):
 {{
   "firstname": "First name",
-  "lastname": "Last name", 
+  "lastname": "Last name",
   "name": "Full Name",
   "email": "email@example.com",
-  "phone": "+1234567890",
-  "title": "Professional Title",
+  "phone": "phone number",
+  "location": "City, State",
+  "title": "Current/Most Recent Job Title",
   "certifications": ["cert1", "cert2"],
-  "education": [{{"degree": "...", "institution": "...", "year": "YYYY"}}],
-  "experience": [{{"Employer": "Company", "title": "Job Title", "start_date": "YYYY-MM", "end_date": "YYYY-MM", "duration_months": N, "responsibilities": ["..."]}}]
-}}"""
+  "education": [
+    {{"degree": "Degree Name", "institution": "University/College Name", "year": "YYYY"}}
+  ],
+  "experience": [
+    {{
+      "employer": "Company Name",
+      "title": "Job Title",
+      "start_date": "YYYY-MM",
+      "end_date": "YYYY-MM or Present",
+      "location": "City, State",
+      "responsibilities": ["responsibility 1", "responsibility 2", "..."]
+    }}
+  ]
+}}
 
-        async with httpx.AsyncClient(timeout=90.0) as client:
+IMPORTANT:
+- Extract the candidate's ACTUAL name from the resume, not job titles
+- For responsibilities, extract 5-15 bullet points per job
+- For education, include institution name and graduation year
+- For certifications, include full certification names
+- Match employers exactly to existing jobs when adding responsibilities"""
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
@@ -1908,67 +2115,145 @@ Return JSON format:
                 
                 if json_match:
                     ai_data = json.loads(json_match.group())
+                    fixed_fields = []
                     
-                    # Extract name fields
-                    for key in ['firstname', 'lastname', 'name', 'email', 'title']:
-                        if ai_data.get(key) and not pr.get(key):
-                            pr[key] = ai_data[key]
+                    # ═══════════════════════════════════════════════════════════
+                    # MERGE AI DATA INTO PARSED RESULT
+                    # ═══════════════════════════════════════════════════════════
                     
-                    # Split name into first/last if we got full name
-                    if ai_data.get('name') and not pr.get('firstname'):
-                        name_parts = ai_data['name'].split()
-                        if len(name_parts) >= 2:
-                            pr['firstname'] = name_parts[0]
-                            pr['lastname'] = name_parts[-1]
+                    # Name fields
+                    if ai_data.get("name") and not pr.get("name"):
+                        pr["name"] = ai_data["name"]
+                        fixed_fields.append("name")
                     
-                    if ai_data.get('phone') and not pr.get('phone_number'):
-                        pr['phone_number'] = ai_data['phone']
+                    if ai_data.get("firstname") and not pr.get("firstname"):
+                        pr["firstname"] = ai_data["firstname"]
+                        fixed_fields.append("firstname")
+                    elif ai_data.get("name") and not pr.get("firstname"):
+                        parts = ai_data["name"].split()
+                        if parts:
+                            pr["firstname"] = parts[0]
+                            fixed_fields.append("firstname")
                     
-                    # Handle certifications
-                    if ai_data.get('certifications'):
-                        existing_certs = pr.get('certifications', [])
-                        new_certs = ai_data['certifications']
-                        if isinstance(new_certs, list) and len(new_certs) > len(existing_certs):
-                            pr['certifications'] = new_certs
+                    if ai_data.get("lastname") and not pr.get("lastname"):
+                        pr["lastname"] = ai_data["lastname"]
+                        fixed_fields.append("lastname")
+                    elif ai_data.get("name") and not pr.get("lastname"):
+                        parts = ai_data["name"].split()
+                        if len(parts) > 1:
+                            pr["lastname"] = parts[-1]
+                            fixed_fields.append("lastname")
                     
-                    if ai_data.get('education') and not pr.get('education'):
-                        pr['education'] = ai_data['education']
+                    # Contact fields
+                    if ai_data.get("email") and not pr.get("email"):
+                        pr["email"] = ai_data["email"]
+                        fixed_fields.append("email")
                     
-                    # Merge responsibilities into existing jobs
-                    if ai_data.get('jobs') and existing_jobs:
-                        ai_jobs = ai_data['jobs']
+                    if ai_data.get("phone") and not pr.get("phone_number"):
+                        pr["phone_number"] = ai_data["phone"]
+                        fixed_fields.append("phone")
+                    
+                    if ai_data.get("location") and not pr.get("location"):
+                        pr["location"] = ai_data["location"]
+                        fixed_fields.append("location")
+                    
+                    if ai_data.get("title") and not pr.get("title"):
+                        pr["title"] = ai_data["title"]
+                        fixed_fields.append("title")
+                    
+                    # Education
+                    if ai_data.get("education"):
+                        existing_edu = pr.get("education", [])
+                        ai_edu = ai_data["education"]
+                        if isinstance(ai_edu, list):
+                            if not existing_edu or len(ai_edu) > len(existing_edu):
+                                pr["education"] = ai_edu
+                                fixed_fields.append("education")
+                            else:
+                                # Merge missing fields
+                                for i, edu in enumerate(existing_edu):
+                                    if i < len(ai_edu):
+                                        if not edu.get("institution") and ai_edu[i].get("institution"):
+                                            edu["institution"] = ai_edu[i]["institution"]
+                                            fixed_fields.append("education_institution")
+                                        if not edu.get("year") and ai_edu[i].get("year"):
+                                            edu["year"] = ai_edu[i]["year"]
+                                            fixed_fields.append("education_year")
+                    
+                    # Certifications
+                    if ai_data.get("certifications"):
+                        existing_certs = pr.get("certifications", [])
+                        ai_certs = ai_data["certifications"]
+                        if isinstance(ai_certs, list) and len(ai_certs) > len(existing_certs):
+                            pr["certifications"] = ai_certs
+                            fixed_fields.append("certifications")
+                    
+                    # Experience - merge responsibilities
+                    if ai_data.get("experience") and existing_jobs:
+                        ai_jobs = ai_data["experience"]
                         for existing_job in existing_jobs:
-                            employer = existing_job.get('Employer', '').lower()
+                            existing_employer = (existing_job.get("Employer") or "").lower()
+                            existing_resp = existing_job.get("responsibilities", [])
+                            
+                            # Find matching AI job
                             for ai_job in ai_jobs:
-                                ai_employer = ai_job.get('employer', '').lower()
-                                # Match by employer name (fuzzy)
-                                if employer and ai_employer:
-                                    if employer in ai_employer or ai_employer in employer or \
-                                       any(word in ai_employer for word in employer.split() if len(word) > 3):
-                                        if ai_job.get('responsibilities') and not existing_job.get('responsibilities'):
-                                            existing_job['responsibilities'] = ai_job['responsibilities']
-                                            break
+                                ai_employer = (ai_job.get("employer") or "").lower()
+                                
+                                # Fuzzy match on employer
+                                if existing_employer and ai_employer:
+                                    match = (
+                                        existing_employer in ai_employer or 
+                                        ai_employer in existing_employer or
+                                        any(word in ai_employer for word in existing_employer.split() if len(word) > 3)
+                                    )
+                                    
+                                    if match:
+                                        ai_resp = ai_job.get("responsibilities", [])
+                                        # Add responsibilities if we have fewer
+                                        if ai_resp and len(ai_resp) > len(existing_resp):
+                                            existing_job["responsibilities"] = ai_resp
+                                            if "responsibilities" not in fixed_fields:
+                                                fixed_fields.append("responsibilities")
+                                        
+                                        # Fill missing employer
+                                        if not existing_job.get("Employer") and ai_job.get("employer"):
+                                            existing_job["Employer"] = ai_job["employer"]
+                                            fixed_fields.append("employer")
+                                        
+                                        # Fill missing location
+                                        if not existing_job.get("location") and ai_job.get("location"):
+                                            existing_job["location"] = ai_job["location"]
+                                        
+                                        break
                     
-                    # If AI returned full experience and we had none
-                    if ai_data.get('experience') and not existing_jobs:
-                        pr['experience'] = ai_data['experience']
+                    # If no existing jobs, use AI jobs entirely
+                    elif ai_data.get("experience") and not existing_jobs:
+                        ai_jobs = ai_data["experience"]
+                        pr["experience"] = [
+                            {
+                                "Employer": j.get("employer"),
+                                "title": j.get("title"),
+                                "start_date": j.get("start_date"),
+                                "end_date": j.get("end_date"),
+                                "location": j.get("location"),
+                                "responsibilities": j.get("responsibilities", []),
+                                "duration_months": 0
+                            }
+                            for j in ai_jobs
+                        ]
+                        fixed_fields.append("experience")
                     
-                    fixed_fields = missing.copy()
-                    if needs_responsibilities:
-                        fixed_fields.append('responsibilities')
-                    
-                    parsed['ai_enhanced'] = True
-                    parsed['ai_fields_fixed'] = fixed_fields
+                    parsed["ai_enhanced"] = True
+                    parsed["ai_fields_fixed"] = list(set(fixed_fields))
             else:
-                parsed['ai_error'] = f"API {response.status_code}: {response.text[:200]}"
+                parsed["ai_error"] = f"API {response.status_code}: {response.text[:200]}"
                     
     except Exception as e:
-        parsed['ai_error'] = str(e)
+        parsed["ai_error"] = str(e)
     
     return parsed
 
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║                           OUTPUT AGENT                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
@@ -2041,6 +2326,7 @@ async def parse_resume(text: str, filename: str = None, use_ai: bool = True) -> 
     validation = validation_agent(result, text)
     result["validation_score"] = validation.score
     result["validation_issues"] = validation.issues
+    result["needs_ai_enhancement"] = validation.needs_ai_enhancement
     
     # ===== AI ENHANCEMENT AGENT =====
     if use_ai and validation.needs_ai_enhancement and ANTHROPIC_API_KEY:
@@ -2120,6 +2406,7 @@ async def parse_file(
 
 
 @app.post("/parse", tags=["Parsing"])
+@app.post("/parse/text", tags=["Parsing"])
 async def parse_text(request: ParseTextRequest):
     """Parse resume from text input."""
     try:
