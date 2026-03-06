@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.6.1"
+VERSION = "8.6.3"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -366,43 +366,128 @@ def extract_text_from_pdf(content: bytes) -> str:
 
 
 def extract_text_from_doc(content: bytes) -> str:
-    """Extract text from legacy .doc files using antiword."""
-    import subprocess
-    import tempfile
-    import os
+    """Extract text from legacy .doc files using pure Python (v8.6.3).
     
+    Uses olefile if available, falls back to direct binary extraction.
+    """
+    text_parts = []
+    
+    # Method 1: Try olefile for OLE compound documents
+    olefile_success = False
     try:
-        # Write to temp file
-        with tempfile.NamedTemporaryFile(suffix='.doc', delete=False) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
+        import olefile
+        if olefile.isOleFile(io.BytesIO(content)):
+            ole = olefile.OleFileIO(io.BytesIO(content))
+            if ole.exists('WordDocument'):
+                word_data = ole.openstream('WordDocument').read()
+                
+                # Extract ASCII text from binary
+                current_text = ""
+                for byte in word_data:
+                    if 32 <= byte <= 126:  # Printable ASCII
+                        current_text += chr(byte)
+                    elif byte in [10, 13]:  # Newlines
+                        if current_text.strip():
+                            text_parts.append(current_text.strip())
+                        current_text = ""
+                    else:
+                        # Non-printable: add space to preserve word boundaries
+                        if current_text and not current_text.endswith(' '):
+                            current_text += ' '
+                
+                if current_text.strip():
+                    text_parts.append(current_text.strip())
+                olefile_success = True
+            ole.close()
+    except ImportError:
+        pass  # olefile not installed
+    except Exception:
+        pass  # olefile failed
+    
+    # Method 2: Direct binary extraction (always runs as fallback)
+    if not olefile_success or not text_parts:
+        text_parts = []  # Reset
+        current_text = ""
+        for byte in content:
+            if 32 <= byte <= 126:  # Printable ASCII
+                current_text += chr(byte)
+            elif byte in [10, 13]:  # Newlines
+                if len(current_text.strip()) > 3:
+                    text_parts.append(current_text.strip())
+                current_text = ""
+            else:
+                # Non-printable: add space
+                if current_text and not current_text.endswith(' '):
+                    current_text += ' '
         
-        # Use antiword
-        result = subprocess.run(['antiword', tmp_path], capture_output=True, text=True, timeout=30)
-        os.unlink(tmp_path)
+        if len(current_text.strip()) > 3:
+            text_parts.append(current_text.strip())
+    
+    # Filter: keep only meaningful text lines
+    filtered_parts = []
+    for part in text_parts:
+        # Normalize whitespace
+        part = ' '.join(part.split())
+        if len(part) < 5:
+            continue
         
-        if result.returncode == 0 and result.stdout:
-            return result.stdout
+        # Always keep lines with contact info or dates
+        if '@' in part:
+            # Extract the meaningful part (might have garbage prefix)
+            email_match = re.search(r'([A-Za-z][A-Za-z\s]*)?\s*Email[:\s]*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+)', part, re.IGNORECASE)
+            if email_match:
+                # Extract name if present before Email
+                name_part = email_match.group(1)
+                if name_part and len(name_part.strip()) > 2:
+                    # Clean up - take only the name part
+                    name_clean = name_part.strip()
+                    # Find where the real name starts (after garbage)
+                    words = name_clean.split()
+                    good_words = []
+                    for w in words:
+                        if len(w) > 2 and w[0].isupper() and w[1:].islower():
+                            good_words.append(w)
+                    if good_words:
+                        filtered_parts.append(' '.join(good_words) + ' Email: ' + email_match.group(2))
+                        continue
+            filtered_parts.append(part)
+            continue
+        if re.search(r'\d{3}[-.\s]?\d{3}[-.\s]?\d{4}', part):
+            filtered_parts.append(part)
+            continue
+        if re.search(r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}', part, re.IGNORECASE):
+            filtered_parts.append(part)
+            continue
         
-        # Fallback: use strings command
-        with tempfile.NamedTemporaryFile(suffix='.doc', delete=False) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
+        # Check text quality - ratio of readable chars
+        readable = sum(1 for c in part if c.isalnum() or c.isspace() or c in '.,;:-@()&/')
+        if readable / len(part) < 0.6:
+            continue
         
-        result = subprocess.run(['strings', '-n', '15', tmp_path], capture_output=True, text=True)
-        os.unlink(tmp_path)
+        # Check average word length (skip garbled text)
+        words = [w for w in part.split() if len(w) > 0]
+        if not words:
+            continue
+        avg_len = sum(len(w) for w in words) / len(words)
+        if avg_len < 2:
+            continue
         
-        if result.stdout:
-            # Filter meaningful lines
-            lines = []
-            for line in result.stdout.split('\n'):
-                if len(line) > 15 and sum(c.isalpha() for c in line) > len(line) * 0.5:
-                    lines.append(line)
-            return '\n'.join(lines)
+        # Skip lines that are mostly single characters
+        single_char_words = sum(1 for w in words if len(w) == 1)
+        if len(words) > 3 and single_char_words / len(words) > 0.5:
+            continue
         
-        return ""
-    except Exception as e:
-        return ""
+        filtered_parts.append(part)
+    
+    # Deduplicate
+    seen = set()
+    result = []
+    for part in filtered_parts:
+        if part not in seen:
+            seen.add(part)
+            result.append(part)
+    
+    return '\n'.join(result)
 
 
 def extract_text_from_docx(content: bytes) -> str:
@@ -1707,6 +1792,82 @@ def extract_experiences(text: str) -> List[Dict]:
                         'responsibilities': responsibilities[:12],
                         'location': None,
                         'pattern': 11
+                    })
+        i += 1
+    
+    # =========================================================================
+    # PATTERN 12: "Client: X / Role: Y" (Venkata/SAP consultant format)
+    # =========================================================================
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        # Look for "Client:" line
+        client_match = re.match(r'^Client:\s*(.+)$', line, re.IGNORECASE)
+        if client_match:
+            employer = client_match.group(1).strip()
+            title = None
+            start_year = end_year = start_month = end_month = None
+            is_present = False
+            
+            # Look for Role and dates in next few lines
+            for j in range(i+1, min(i+8, len(lines))):
+                next_line = lines[j].strip()
+                
+                # Role line
+                role_match = re.match(r'^Role:\s*(.+)$', next_line, re.IGNORECASE)
+                if role_match:
+                    title = role_match.group(1).strip()
+                
+                # Date patterns - various formats
+                # "January 2013 to August 2015" or "Apr 2019 - Present"
+                date_match = re.search(
+                    r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*(\d{4})\s*(?:to|[-–])\s*(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|Present|Current|Till)\s*(\d{4})?',
+                    next_line, re.IGNORECASE
+                )
+                if date_match:
+                    start_year, start_month, _ = parse_date(f"{date_match.group(1)} {date_match.group(2)}")
+                    end_str = date_match.group(3)
+                    if end_str.lower() in ['present', 'current', 'till']:
+                        end_year = datetime.now().year
+                        end_month = datetime.now().month
+                        is_present = True
+                    else:
+                        end_year_str = date_match.group(4) or str(datetime.now().year)
+                        end_year, end_month, is_present = parse_date(f"{end_str} {end_year_str}")
+                    break
+            
+            # If no dates found, try to infer from position (most recent first)
+            if not start_year:
+                # Skip if no dates - will be caught by AI enhancement
+                i += 1
+                continue
+            
+            # Extract responsibilities
+            responsibilities = extract_responsibilities(lines, i + 1, i + 25)
+            
+            if start_year and end_year:
+                duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
+                start_date = f"{start_year}-{(start_month or 1):02d}"
+                end_date = f"{end_year}-{(end_month or 12):02d}" if not is_present else f"{datetime.now().year}-{datetime.now().month:02d}"
+                
+                # Check for duplicates
+                is_dup = any(
+                    e.get('start_date') == start_date and
+                    (e.get('employer') or '').lower() in (employer or '').lower()
+                    for e in experiences
+                )
+                
+                if not is_dup and employer:
+                    experiences.append({
+                        'employer': employer,
+                        'title': title,
+                        'start_date': start_date,
+                        'end_date': end_date,
+                        'duration_months': duration,
+                        'responsibilities': responsibilities[:12],
+                        'location': None,
+                        'pattern': 12
                     })
         i += 1
     
