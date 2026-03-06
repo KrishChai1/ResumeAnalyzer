@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.5.0"
+VERSION = "8.6.1"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -152,6 +152,13 @@ SKILL_CATEGORIES = {
         "banking", "finance", "financial services", "insurance", "healthcare",
         "telecom", "retail", "e-commerce", "manufacturing", "pharma",
         "investment banking", "capital markets", "payments", "billing"
+    ],
+    "SAP & ERP": [
+        "sap", "sap s/4 hana", "sap hana", "sap sd", "sap mm", "sap fi", "sap co",
+        "sap wm", "sap ewm", "sap tm", "sap cs", "sap pm", "sap pp", "sap qm",
+        "sap bw", "sap abap", "sap fico", "sap basis", "sap brim", "sap rar",
+        "sap otc", "sap gts", "oracle erp", "oracle ebs", "peoplesoft",
+        "dynamics 365", "d365", "netsuite", "workday", "sap btp", "sap c4c"
     ]
 }
 
@@ -358,15 +365,61 @@ def extract_text_from_pdf(content: bytes) -> str:
     return text
 
 
+def extract_text_from_doc(content: bytes) -> str:
+    """Extract text from legacy .doc files using antiword."""
+    import subprocess
+    import tempfile
+    import os
+    
+    try:
+        # Write to temp file
+        with tempfile.NamedTemporaryFile(suffix='.doc', delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        # Use antiword
+        result = subprocess.run(['antiword', tmp_path], capture_output=True, text=True, timeout=30)
+        os.unlink(tmp_path)
+        
+        if result.returncode == 0 and result.stdout:
+            return result.stdout
+        
+        # Fallback: use strings command
+        with tempfile.NamedTemporaryFile(suffix='.doc', delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        result = subprocess.run(['strings', '-n', '15', tmp_path], capture_output=True, text=True)
+        os.unlink(tmp_path)
+        
+        if result.stdout:
+            # Filter meaningful lines
+            lines = []
+            for line in result.stdout.split('\n'):
+                if len(line) > 15 and sum(c.isalpha() for c in line) > len(line) * 0.5:
+                    lines.append(line)
+            return '\n'.join(lines)
+        
+        return ""
+    except Exception as e:
+        return ""
+
+
 def extract_text_from_docx(content: bytes) -> str:
-    """Extract text from DOCX including tables and text boxes (v8.4.1)."""
+    """Extract text from DOCX including tables and text boxes (v8.6.0)."""
     try:
         from docx import Document
         doc = Document(io.BytesIO(content))
         
         all_text = []
         
-        # Extract tables FIRST (often contain name/header info)
+        # First check for name in first few paragraphs (common location)
+        for para in doc.paragraphs[:5]:
+            text = para.text.strip()
+            if text:
+                all_text.append(text)
+        
+        # Then extract tables (contain name/header for some resumes)
         for table in doc.tables:
             for row in table.rows:
                 row_text = []
@@ -377,8 +430,8 @@ def extract_text_from_docx(content: bytes) -> str:
                 if row_text:
                     all_text.append(' | '.join(row_text))
         
-        # Then extract paragraphs
-        for para in doc.paragraphs:
+        # Then remaining paragraphs
+        for para in doc.paragraphs[5:]:
             text = para.text.strip()
             if text:
                 all_text.append(text)
@@ -433,7 +486,9 @@ def extract_text_intelligent(content: bytes, filename: str) -> str:
     
     if file_type == 'pdf':
         return extract_text_from_pdf(content)
-    elif file_type in ['docx', 'doc']:
+    elif file_type == 'doc':
+        return extract_text_from_doc(content)
+    elif file_type == 'docx':
         return extract_text_from_docx(content)
     elif file_type == 'zip_text':
         return extract_text_from_zip(content)
@@ -577,12 +632,12 @@ def extract_contact(text: str) -> Dict[str, str]:
     if match:
         contact['email'] = match.group(1).lower()
     
-    # Phone
+    # Phone - updated patterns for various formats
     phone_patterns = [
-        r'(?:Mob|Phone|Tel|Mobile|Cell|Ph)[:\s]*(\+?[\d\s\-().]{10,})',
-        r'(\+1\s*\(\d{3}\)\s*\d{3}[-.\s]?\d{4})',
-        r'(\(\d{3}\)\s*\d{3}[-.\s]?\d{4})',
-        r'(\+\d{1,3}[-.\s]?\d{3}[-.\s]?\d{3}[-.\s]?\d{4})',
+        r'(?:Mob|Phone|Tel|Mobile|Cell|Ph|Contact)[\s]*(?:No)?[:\s]*(\+?[\d\s\-().]{10,})',
+        r'(\+1\s*\(?\d{3}\)?[-.\s]*\d{3}[-.\s]*\d{4})',
+        r'(\(\d{3}\)[-.\s]*\d{3}[-.\s]*\d{4})',
+        r'(\+\d{1,3}[-.\s]*\(?\d{3}\)?[-.\s]*\d{3}[-.\s]*\d{4})',
         r'(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})',
     ]
     for pattern in phone_patterns:
@@ -650,7 +705,39 @@ def extract_name(text: str, filename: str = "") -> Tuple[str, str, str]:
             return parts[0], ' '.join(parts[1:-1]), parts[-1]
         return "", "", ""
     
-    # Strategy 0: Look for name in first 15 lines (handles indented names)
+    # Strategy 0a: Check if first non-empty line is a single capitalized name followed by Email line
+    # This handles formats like "Venkata\nEmail: ..." or "Ramaswamy Tati                Email: ..."
+    for i, line in enumerate(lines[:10]):
+        clean_line = line.strip()
+        if not clean_line:
+            continue
+        
+        # Check if this line contains a name followed by Email on same line or next line
+        # Pattern: "Name                       Email: ..."
+        name_email_match = re.match(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:Email|Mobile|Phone|Contact)', clean_line)
+        if name_email_match:
+            name_str = name_email_match.group(1).strip()
+            parts = name_str.split()
+            if 1 <= len(parts) <= 4:
+                if not any(p.upper() in TECH_TERMS for p in parts):
+                    if len(parts) == 1:
+                        return parts[0], "", ""
+                    return split_name_parts(parts)
+        
+        # Check if line is just a single capitalized name and next line has Email/Contact
+        if '@' not in clean_line and ':' not in clean_line:
+            parts = clean_line.split()
+            if 1 <= len(parts) <= 4 and all(p.isalpha() and p[0].isupper() for p in parts):
+                # Check next line for Email/Contact
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].lower().strip()
+                    if any(kw in next_line for kw in ['email', 'phone', 'mobile', 'contact', '@']):
+                        if not any(skip in clean_line.lower() for skip in skip_patterns):
+                            if len(parts) == 1:
+                                return parts[0], "", ""
+                            return split_name_parts(parts)
+    
+    # Strategy 0b: Look for name in first 15 lines (handles indented names)
     for line in lines[:15]:
         clean_line = line.strip()
         if not clean_line or clean_line.startswith(('-', ':', '|')):
@@ -743,12 +830,16 @@ def extract_name(text: str, filename: str = "") -> Tuple[str, str, str]:
         base = re.sub(r'\.(pdf|docx|doc)$', '', filename, flags=re.IGNORECASE)
         base = re.sub(r'[-_]?(Resume|CV)[-_]?\d*$', '', base, flags=re.IGNORECASE)
         base = re.sub(r'[-_]?\d+$', '', base)
+        base = re.sub(r'[-_]?(OTC|TM|RAR|GCP|ETL)[-_]?', '', base, flags=re.IGNORECASE)
         parts = re.split(r'[-_]', base)
         non_name_parts = {'resume', 'cv', 'data', 'engineer', 'developer', 'manager', 
                          'consultant', 'sr', 'junior', 'senior', 'lead', 'gcp', 'aws',
                          'java', 'python', 'etl', 'devops', 'it', 'pm', 'scrum', 'master',
-                         'project', 'snowflake', 'cloud'}
+                         'project', 'snowflake', 'cloud', 'otc', 'tm', 'rar', 'sap', 'hana'}
         parts = [p.strip() for p in parts if p.strip().lower() not in non_name_parts and len(p) > 1]
+        if len(parts) == 1 and len(parts[0]) > 3:
+            # Single name from filename - might be first name only (e.g., "Venkata")
+            return parts[0].title(), "", ""
         if 2 <= len(parts) <= 4:
             return split_name_parts([p.title() for p in parts])
     
@@ -760,20 +851,41 @@ def extract_name(text: str, filename: str = "") -> Tuple[str, str, str]:
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def extract_responsibilities(lines: List[str], start_idx: int, end_idx: int) -> List[str]:
-    """Extract responsibilities from lines (v8.4.1 - handles plain text)."""
+    """Extract responsibilities from lines (v8.6 - handles plain text and bullets)."""
     responsibilities = []
     current_resp = ""
     bullet_only_line = False
-    after_resp_header = False  # Track if we're after "Responsibilities:" header
+    
+    # Check if the line before start_idx is a responsibility header
+    after_resp_header = False
+    if start_idx > 0:
+        prev_line = lines[start_idx - 1].strip()
+        if re.match(r'^(Contribution|Responsibilities)[\s&]*:?\s*$', prev_line, re.IGNORECASE):
+            after_resp_header = True
     
     for i in range(start_idx, min(end_idx, len(lines))):
         line = lines[i]
         stripped = line.strip().rstrip('\r')
         
-        # Skip "Responsibilities:" header
-        if re.match(r'^Responsibilities\s*:?\s*$', stripped, re.IGNORECASE):
+        # Skip empty lines
+        if not stripped:
+            continue
+        
+        # Skip "Contribution & Responsibilities:" or similar headers
+        if re.match(r'^(Contribution|Responsibilities)[\s&]*:?\s*$', stripped, re.IGNORECASE):
             after_resp_header = True
             continue
+        
+        # Stop at next Project/Client/Duration section
+        if re.match(r'^(Project|Client|Duration|Environment|Description)\s*[:\t]', stripped, re.IGNORECASE):
+            break
+        
+        # Plain text responsibility (sentence starting with action verb)
+        if re.match(r'^(Participate|Collaborate|Wrote|Test|Revise|Improve|Involve|Serve|Design|Develop|Manage|Create|Implement|Lead|Support|Analyze|Build|Configure|Maintain|Monitor|Deploy|Review|Ensure|Establish|Coordinate|Execute|Perform|Provide|Work|Assist|Conduct|Document|Deliver|Define|Evaluate|Facilitate|Guide|Handle|Identify|Install|Integrate|Investigate|Launch|Migrate|Optimize|Organize|Oversee|Plan|Prepare|Process|Produce|Program|Research|Resolve|Schedule|Secure|Setup|Streamline|Supervise|Train|Troubleshoot|Update|Upgrade|Validate|Verify|Write)', stripped, re.IGNORECASE):
+            if len(stripped) > 20:
+                responsibilities.append(stripped[:500])
+                after_resp_header = True  # Mark that we're in responsibilities section
+                continue
         
         # Stop at section headers
         if re.match(r'^(EDUCATION|TECHNICAL|SKILLS|CERTIFICATIONS|PERSONAL|EXPERIENCE\s*$)', stripped, re.IGNORECASE):
@@ -1503,8 +1615,8 @@ def extract_experiences(text: str) -> List[Dict]:
                 
                 is_dup = any(
                     e.get('start_date') == start_date and
-                    (e.get('employer', '').lower() == (employer or '').lower() or
-                     e.get('title', '').lower() == (title or '').lower())
+                    ((e.get('employer') or '').lower() == (employer or '').lower() or
+                     (e.get('title') or '').lower() == (title or '').lower())
                     for e in experiences
                 )
                 
@@ -1521,15 +1633,118 @@ def extract_experiences(text: str) -> List[Dict]:
                     })
         i += 1
     
+    # =========================================================================
+    # PATTERN 11: "Project: X / Client: Y / Duration: Z" (Chakri format)
+    # =========================================================================
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        # Look for "Project" line with tab or colon
+        project_match = re.match(r'^Project\s*[:\t]+\s*(.+)$', line, re.IGNORECASE)
+        if project_match:
+            project_name = project_match.group(1).strip()
+            
+            # Look for Client and Duration in next few lines
+            employer = None
+            start_year = end_year = start_month = end_month = None
+            is_present = False
+            
+            for j in range(i+1, min(i+5, len(lines))):
+                next_line = lines[j].strip()
+                
+                # Client line
+                client_match = re.match(r'^Client\s*[:\t]+\s*(.+)$', next_line, re.IGNORECASE)
+                if client_match:
+                    employer = client_match.group(1).strip()
+                
+                # Duration line
+                duration_match = re.match(r'^Duration\s*[:\t]*\s*(.+)$', next_line, re.IGNORECASE)
+                if duration_match:
+                    date_str = duration_match.group(1).strip()
+                    # Parse dates like "April 2021 to SEP 2024"
+                    date_range = re.search(
+                        r'(\w+)\s*(\d{4})\s*(?:to|[-–])\s*(\w+)\s*(\d{4}|Present|Current|Till)',
+                        date_str, re.IGNORECASE
+                    )
+                    if date_range:
+                        start_year, start_month, _ = parse_date(f"{date_range.group(1)} {date_range.group(2)}")
+                        end_str = date_range.group(4)
+                        if end_str.lower() in ['present', 'current', 'till']:
+                            end_year = datetime.now().year
+                            end_month = datetime.now().month
+                            is_present = True
+                        else:
+                            end_year, end_month, is_present = parse_date(f"{date_range.group(3)} {date_range.group(4)}")
+            
+            # Look for responsibilities
+            resp_start = i + 1
+            for j in range(i+1, min(i+10, len(lines))):
+                if re.match(r'^(Contribution|Responsibilities)', lines[j].strip(), re.IGNORECASE):
+                    resp_start = j + 1
+                    break
+            
+            responsibilities = extract_responsibilities(lines, resp_start, i + 25)
+            
+            if start_year and end_year:
+                duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
+                start_date = f"{start_year}-{(start_month or 1):02d}"
+                end_date = f"{end_year}-{(end_month or 12):02d}" if not is_present else f"{datetime.now().year}-{datetime.now().month:02d}"
+                
+                is_dup = any(
+                    e.get('start_date') == start_date and
+                    (e.get('employer') or '').lower() == (employer or '').lower()
+                    for e in experiences
+                )
+                
+                if not is_dup and (employer or project_name):
+                    experiences.append({
+                        'employer': employer if employer else project_name,
+                        'title': project_name if employer else None,
+                        'start_date': start_date,
+                        'end_date': end_date,
+                        'duration_months': duration,
+                        'responsibilities': responsibilities[:12],
+                        'location': None,
+                        'pattern': 11
+                    })
+        i += 1
+    
     # Sort by start date (most recent first)
     experiences.sort(key=lambda x: x.get('start_date', ''), reverse=True)
     
-    # Remove pattern field from output
+    # Remove pattern field and filter/clean invalid entries
+    valid_experiences = []
+    seen = set()
+    
     for exp in experiences:
         exp.pop('pattern', None)
         exp.pop('client', None)
+        
+        employer = exp.get('employer') or ''
+        
+        # Skip entries with "Duration:" as employer
+        if employer.lower().startswith('duration'):
+            continue
+        
+        # Skip entries without both employer and title
+        if not employer and not exp.get('title'):
+            continue
+        
+        # Clean "Client:" prefix from employer names
+        if employer.lower().startswith('client:'):
+            employer = employer[7:].strip()
+            exp['employer'] = employer
+        
+        # Remove duplicate entries (same employer + start_date)
+        key = (employer.lower(), exp.get('start_date', ''))
+        if key in seen:
+            continue
+        seen.add(key)
+        
+        valid_experiences.append(exp)
     
-    return experiences
+    return valid_experiences
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -1537,13 +1752,46 @@ def extract_experiences(text: str) -> List[Dict]:
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def extract_education(text: str) -> List[Dict]:
-    """Extract education from resume text."""
+    """Extract education from resume text (v8.6)."""
     education = []
     seen_degrees = set()
     
+    # First check for pipe-separated format: "Education | Degree at/from University"
+    for line in text.split('\n'):
+        line = line.strip()
+        if line.lower().startswith('education') and '|' in line:
+            parts = line.split('|', 1)
+            if len(parts) >= 2:
+                edu_text = parts[1].strip()
+                # Parse "Master of Computer Application (M.C.A) at Osmania University, India"
+                at_match = re.search(r'(.+?)\s+at\s+(.+)', edu_text, re.IGNORECASE)
+                from_match = re.search(r'(.+?)\s+from\s+(.+)', edu_text, re.IGNORECASE)
+                
+                if at_match:
+                    education.append({
+                        'degree': at_match.group(1).strip(),
+                        'institution': at_match.group(2).strip(),
+                        'year': None
+                    })
+                elif from_match:
+                    education.append({
+                        'degree': from_match.group(1).strip(),
+                        'institution': from_match.group(2).strip(),
+                        'year': None
+                    })
+                else:
+                    education.append({
+                        'degree': edu_text,
+                        'institution': None,
+                        'year': None
+                    })
+    
+    if education:
+        return education
+    
     edu_match = re.search(
         r'(?:EDUCATION(?:AL)?\s*(?:QUALIFICATION|BACKGROUND)?|ACADEMIC\s*(?:QUALIFICATION)?)'
-        r'[:\s]*\n?(.+?)(?:\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nSKILLS|\nCERTIFI|\nEXPERIENCE|\Z)',
+        r'[:\s]*\n?(.+?)(?:\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nSKILLS|\nCERTIFI|\nEXPERIENCE|\nCLIENT:|\Z)',
         text, re.IGNORECASE | re.DOTALL
     )
     
@@ -1556,7 +1804,13 @@ def extract_education(text: str) -> List[Dict]:
             line = re.sub(r'^[•·\-\*]\s*', '', line).strip()
             if not line:
                 continue
-            if re.match(r'^(Worked|Working|PROFESSIONAL)', line, re.IGNORECASE):
+            # Skip non-education lines
+            if re.match(r'^(Worked|Working|PROFESSIONAL|Client:|Duration:|Tools|Brief|Role|Environment)', line, re.IGNORECASE):
+                continue
+            # Skip lines that look like job descriptions
+            if 'Bank' in line and 'Duration' in line:
+                continue
+            if re.match(r'^\|', line):
                 continue
             
             entry = {}
@@ -1621,9 +1875,34 @@ def extract_education(text: str) -> List[Dict]:
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def extract_certifications(text: str) -> List[str]:
-    """Extract certifications from resume text."""
+    """Extract certifications from resume text (v8.6)."""
     certifications = []
     
+    # Check for certification patterns in first 40 lines
+    for line in text.split('\n')[:40]:
+        line = line.strip()
+        
+        # Pattern 1: "Certified Consultant/Professional/Expert..."
+        if re.match(r'^Certified\s+(Consultant|Professional|Expert|Scrum|AWS|Azure|Google|SAP|Business|Data|Cloud|Solution|Associate|Developer|Administrator)', line, re.IGNORECASE):
+            cert = re.sub(r'^[•·\-\*]\s*', '', line).strip()
+            if cert and len(cert) > 10 and cert not in certifications:
+                certifications.append(cert)
+        
+        # Pattern 2: "AWS/Azure/Google/SAP Certified..."
+        elif re.match(r'^(AWS|Azure|Google|Google Cloud|SAP|Microsoft|Oracle|Cisco|PMP|ITIL|Scrum)\s+Certified', line, re.IGNORECASE):
+            cert = re.sub(r'^[•·\-\*]\s*', '', line).strip()
+            if cert and len(cert) > 10 and cert not in certifications:
+                certifications.append(cert)
+        
+        # Pattern 3: Contains "Certified" and common cert keywords
+        elif 'certified' in line.lower() and any(kw in line.lower() for kw in ['cloud', 'engineer', 'architect', 'developer', 'administrator', 'associate', 'professional', 'scrum', 'pmp', 'aws', 'azure', 'gcp']):
+            cert = re.sub(r'^[•·\-\*]\s*', '', line).strip()
+            # Clean up trailing periods
+            cert = cert.rstrip('.')
+            if cert and len(cert) > 10 and cert not in certifications:
+                certifications.append(cert)
+    
+    # Then check for CERTIFICATIONS section
     cert_match = re.search(
         r'CERTIFICATIONS?(?:\s*/\s*TRAININGS?)?[:\s]*\n(.+?)(?:\nPROFESSIONAL|\nEXPERIENCE|\nEDUCATION|\nSKILLS|\nTOOLS|\Z)',
         text, re.IGNORECASE | re.DOTALL
@@ -1636,7 +1915,8 @@ def extract_certifications(text: str) -> List[str]:
                 if re.match(r'^(PROFESSIONAL|EXPERIENCE|IMG|IBM|Cognizant)', line, re.IGNORECASE):
                     continue
                 line = re.sub(r'\s*[-–]\s*In Progress\.?$', '', line, flags=re.IGNORECASE)
-                certifications.append(line)
+                if line not in certifications:
+                    certifications.append(line)
     
     return list(dict.fromkeys(certifications))[:20]
 
@@ -1818,8 +2098,46 @@ AI ENHANCEMENT TRIGGERS:
 
 def validation_agent(parsed: Dict, text: str) -> ValidationResult:
     """
-    Comprehensive validation with detailed rules (v8.5).
-    Triggers AI enhancement for any significant gaps.
+    Comprehensive validation with detailed rules (v8.6.1).
+    
+    VALIDATION RULES:
+    ═══════════════════════════════════════════════════════════════════════════
+    CRITICAL (15 pts each):
+      1. name         - Must exist, 2+ chars, not a job title
+      2. email        - Valid format with @
+      3. experience   - At least 1 job
+    
+    IMPORTANT (8 pts each):
+      4. phone        - Phone number
+      5. title        - Job title
+    
+    IDENTITY (3 pts each):
+      6. firstname    - First name extracted
+      7. lastname     - Last name extracted
+    
+    EXPERIENCE QUALITY:
+      8. responsibilities  - 5+ total (10 pts), 10+ expected (5 pts)
+      9. employers         - More than half should have employer
+      10. job_titles       - More than half should have title
+      11. dates            - More than half should have dates
+    
+    CONTENT:
+      12. education        - When text has degree keywords (5 pts)
+      13. certifications   - When text has "certified" (3 pts)
+      14. location         - When text has location patterns (2 pts)
+      15. skills           - At least 5 technical skills (3 pts)
+      16. skill_experience - Should have non-zero values (2 pts)
+    
+    QUALITY:
+      17. duplicate_employers    - Same employer multiple times (3 pts)
+      18. excessive_education    - More than 5 entries likely error (5 pts)
+      19. single_word_name       - Only firstname, no lastname (3 pts)
+    
+    AI ENHANCEMENT TRIGGERS:
+      - Any critical field missing
+      - Score below 70
+      - quality_issues: low_responsibilities, missing_employers, duplicate_employers
+      - content_gaps: missing_education, missing_certifications, single_word_name
     """
     result = ValidationResult()
     pr = parsed.get("parsed_resume", {})
@@ -1980,6 +2298,58 @@ def validation_agent(parsed: Dict, text: str) -> ValidationResult:
         result.score -= 3
     
     # ═══════════════════════════════════════════════════════════════════════════
+    # SKILL EXPERIENCE CHECK
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    key_skills = pr.get("key_skills", {})
+    if key_skills:
+        # Check if all skill experience is 0
+        all_skills_zero = True
+        for category_skills in key_skills.values():
+            if isinstance(category_skills, list):
+                for skill_info in category_skills:
+                    if isinstance(skill_info, dict) and skill_info.get("experience_months", 0) > 0:
+                        all_skills_zero = False
+                        break
+        
+        if all_skills_zero and experiences:
+            result.issues.append("skill_experience_not_calculated")
+            result.score -= 2
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DUPLICATE EMPLOYER CHECK
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    if experiences:
+        employer_counts = {}
+        for exp in experiences:
+            emp = (exp.get("Employer") or "").lower().strip()
+            if emp:
+                employer_counts[emp] = employer_counts.get(emp, 0) + 1
+        
+        duplicate_employers = [e for e, count in employer_counts.items() if count > 1]
+        if duplicate_employers:
+            result.issues.append("duplicate_employers")
+            result.score -= 3
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # EXCESSIVE EDUCATION CHECK (likely parsing error)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    if len(education) > 5:
+        result.issues.append("excessive_education_entries")
+        result.score -= 5
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SINGLE WORD NAME CHECK
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    if name and len(name.split()) == 1:
+        result.issues.append("single_word_name")
+        result.missing_fields.append("lastname")
+        result.score -= 3
+    
+    # ═══════════════════════════════════════════════════════════════════════════
     # AI ENHANCEMENT DECISION
     # ═══════════════════════════════════════════════════════════════════════════
     
@@ -1988,17 +2358,23 @@ def validation_agent(parsed: Dict, text: str) -> ValidationResult:
     # - Score below 70
     # - Low responsibilities
     # - Missing education/certs when text suggests they exist
+    # - Single-word name (missing lastname)
+    # - Skill experience not calculated
+    # - Duplicate employers detected
+    # - Excessive education entries
     
     critical_missing = any(issue in result.issues for issue in [
         "missing_name", "invalid_name", "missing_email", "missing_experience"
     ])
     
     quality_issues = any(issue in result.issues for issue in [
-        "low_responsibilities", "missing_employers", "missing_job_titles"
+        "low_responsibilities", "missing_employers", "missing_job_titles",
+        "skill_experience_not_calculated", "duplicate_employers", "excessive_education_entries"
     ])
     
     content_gaps = any(issue in result.issues for issue in [
-        "missing_education", "missing_certifications", "missing_location"
+        "missing_education", "missing_certifications", "missing_location",
+        "missing_lastname", "missing_firstname", "single_word_name"
     ])
     
     result.needs_ai_enhancement = (
