@@ -2572,6 +2572,13 @@ async def ai_enhancement_agent(text: str, parsed: Dict, validation: ValidationRe
         
         # Build comprehensive prompt based on what's needed
         existing_jobs = pr.get("experience", [])
+        
+        # Run diagnosis to understand what patterns exist
+        try:
+            diagnosis = diagnose_extraction(text, "")
+            raw_patterns = diagnosis.get("raw_patterns_found", {})
+        except:
+            raw_patterns = {}
         job_list = ""
         if existing_jobs:
             job_list = "EXISTING JOBS FOUND:\n" + "\n".join([
@@ -2793,6 +2800,157 @@ IMPORTANT:
 
 # ║                           OUTPUT AGENT                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                    SELF-DIAGNOSIS & DEBUG SYSTEM (v8.6.3)                    ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+def diagnose_extraction(text: str, filename: str) -> Dict:
+    """
+    Comprehensive diagnosis of what was extracted and what's missing.
+    Returns detailed report for debugging new formats.
+    """
+    diagnosis = {
+        "filename": filename,
+        "text_length": len(text),
+        "text_preview": text[:500] if text else "",
+        "extraction_results": {},
+        "issues_found": [],
+        "suggestions": [],
+        "raw_patterns_found": {}
+    }
+    
+    # Check what patterns exist in raw text
+    text_lower = text.lower()
+    
+    # Name patterns
+    name_patterns = {
+        "name_email_line": bool(re.search(r'^[A-Z][a-z]+.*Email', text[:500], re.MULTILINE)),
+        "all_caps_name": bool(re.search(r'^[A-Z]{2,}\s+[A-Z]{2,}', text[:300], re.MULTILINE)),
+        "title_case_name": bool(re.search(r'^[A-Z][a-z]+\s+[A-Z][a-z]+', text[:300], re.MULTILINE)),
+    }
+    diagnosis["raw_patterns_found"]["name"] = name_patterns
+    
+    # Contact patterns
+    contact_patterns = {
+        "email": bool(re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)),
+        "phone_standard": bool(re.search(r'\d{3}[-.]?\d{3}[-.]?\d{4}', text)),
+        "phone_intl": bool(re.search(r'\+1.*\d{3}.*\d{3}.*\d{4}', text)),
+        "linkedin": bool(re.search(r'linkedin', text_lower)),
+    }
+    diagnosis["raw_patterns_found"]["contact"] = contact_patterns
+    
+    # Experience patterns
+    exp_patterns = {
+        "client_role": bool(re.search(r'Client:\s*.+', text)),
+        "project_client": bool(re.search(r'Project\s*[:\t]', text)),
+        "company_dates": bool(re.search(r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}\s*[-–to]', text, re.IGNORECASE)),
+        "pipe_format": bool(re.search(r'[A-Za-z]+\s*\|\s*[A-Za-z]+\s*\|', text)),
+        "date_range": bool(re.search(r'\d{4}\s*[-–]\s*(\d{4}|Present|Current)', text, re.IGNORECASE)),
+    }
+    diagnosis["raw_patterns_found"]["experience"] = exp_patterns
+    
+    # Education patterns  
+    edu_patterns = {
+        "education_section": bool(re.search(r'EDUCATION', text, re.IGNORECASE)),
+        "degree_keyword": bool(re.search(r'(Bachelor|Master|MBA|MCA|B\.?Tech|M\.?Tech|Ph\.?D)', text, re.IGNORECASE)),
+        "university": bool(re.search(r'University|College|Institute', text, re.IGNORECASE)),
+        "pipe_education": bool(re.search(r'Education\s*\|', text, re.IGNORECASE)),
+    }
+    diagnosis["raw_patterns_found"]["education"] = edu_patterns
+    
+    # Certification patterns
+    cert_patterns = {
+        "certified_keyword": bool(re.search(r'Certified', text, re.IGNORECASE)),
+        "certification_section": bool(re.search(r'CERTIFICATION', text, re.IGNORECASE)),
+        "aws_cert": bool(re.search(r'AWS\s+Certified', text, re.IGNORECASE)),
+        "pmp": bool(re.search(r'\bPMP\b', text)),
+    }
+    diagnosis["raw_patterns_found"]["certifications"] = cert_patterns
+    
+    # Now do actual extraction and compare
+    contact = extract_contact(text)
+    firstname, middle, lastname = extract_name(text, filename)
+    experiences = extract_experiences(text)
+    education = extract_education(text)
+    certifications = extract_certifications(text)
+    skills = extract_skills(text)
+    
+    diagnosis["extraction_results"] = {
+        "name": f"{firstname} {middle} {lastname}".strip(),
+        "email": contact.get("email"),
+        "phone": contact.get("phone"),
+        "experience_count": len(experiences),
+        "education_count": len(education),
+        "certification_count": len(certifications),
+        "skill_count": sum(len(v) for v in skills.values()),
+        "total_responsibilities": sum(len(e.get("responsibilities", [])) for e in experiences),
+    }
+    
+    # Generate suggestions based on gaps
+    if not firstname and name_patterns.get("all_caps_name"):
+        diagnosis["suggestions"].append("Name appears to be in ALL CAPS format - check extract_name patterns")
+    if not firstname and name_patterns.get("name_email_line"):
+        diagnosis["suggestions"].append("Name + Email on same line detected - check Strategy 0a")
+    
+    if not contact.get("phone") and contact_patterns.get("phone_intl"):
+        diagnosis["suggestions"].append("International phone format detected but not extracted - check phone_patterns")
+    
+    if len(experiences) == 0 and exp_patterns.get("client_role"):
+        diagnosis["suggestions"].append("Client:/Role: format detected but no jobs extracted - check Pattern 12")
+    if len(experiences) == 0 and exp_patterns.get("project_client"):
+        diagnosis["suggestions"].append("Project:/Client: format detected but no jobs extracted - check Pattern 11")
+    
+    if len(education) == 0 and edu_patterns.get("degree_keyword"):
+        diagnosis["suggestions"].append("Degree keywords found but no education extracted - check extract_education")
+    if len(education) == 0 and edu_patterns.get("pipe_education"):
+        diagnosis["suggestions"].append("Pipe-format education detected - check pipe-separated extraction")
+    
+    if len(certifications) == 0 and cert_patterns.get("certified_keyword"):
+        diagnosis["suggestions"].append("'Certified' keyword found but not extracted - check extract_certifications")
+    
+    return diagnosis
+
+
+def format_diagnosis_report(diagnosis: Dict) -> str:
+    """Format diagnosis as readable report."""
+    report = []
+    report.append("=" * 80)
+    report.append(f"DIAGNOSIS REPORT: {diagnosis['filename']}")
+    report.append("=" * 80)
+    
+    report.append(f"\nText Length: {diagnosis['text_length']} chars")
+    report.append(f"\nText Preview (first 300 chars):")
+    report.append(diagnosis['text_preview'][:300])
+    
+    report.append("\n" + "-" * 40)
+    report.append("RAW PATTERNS DETECTED:")
+    report.append("-" * 40)
+    for category, patterns in diagnosis['raw_patterns_found'].items():
+        report.append(f"\n{category.upper()}:")
+        for pattern, found in patterns.items():
+            status = "✅" if found else "❌"
+            report.append(f"  {status} {pattern}")
+    
+    report.append("\n" + "-" * 40)
+    report.append("EXTRACTION RESULTS:")
+    report.append("-" * 40)
+    for field, value in diagnosis['extraction_results'].items():
+        status = "✅" if value else "❌"
+        report.append(f"  {status} {field}: {value}")
+    
+    if diagnosis['suggestions']:
+        report.append("\n" + "-" * 40)
+        report.append("SUGGESTIONS TO FIX:")
+        report.append("-" * 40)
+        for i, suggestion in enumerate(diagnosis['suggestions'], 1):
+            report.append(f"  {i}. {suggestion}")
+    
+    return "\n".join(report)
+
+
 
 async def parse_resume(text: str, filename: str = None, use_ai: bool = True) -> Dict:
     """
