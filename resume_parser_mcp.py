@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.6.3"
+VERSION = "8.8.0"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -746,13 +746,27 @@ def extract_contact(text: str) -> Dict[str, str]:
                 contact['linkedin'] = f"www.linkedin.com/in/{username}"
                 break
     
-    # Location
-    for city in LOCATION_CITIES[:30]:
-        pattern = rf'\b{re.escape(city)}[,\s]+(PA|TX|IL|NY|CA|GA|OH|IN|India|USA|Karnataka|Maharashtra|UK|Germany)\b'
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            contact['location'] = f"{city}, {match.group(1)}"
-            break
+    # Location - prioritize first 10 lines (header area)
+    header_text = '\n'.join(text.split('\n')[:10])
+    
+    # Common US state abbreviations and countries
+    state_country_pattern = r'(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|India|USA|UK|Canada|Germany|Australia|Singapore|UAE|Karnataka|Maharashtra|Tamil Nadu|Telangana|Andhra Pradesh)'
+    
+    # First try to find location in header (first 10 lines)
+    # Pattern: City, STATE or City STATE
+    header_loc_match = re.search(rf'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)[,\s]+{state_country_pattern}\b', header_text)
+    if header_loc_match:
+        city = header_loc_match.group(1).strip()
+        state = header_loc_match.group(2).strip()
+        contact['location'] = f"{city}, {state}"
+    else:
+        # Fallback: search full text but only first occurrence
+        for city in LOCATION_CITIES[:30]:
+            pattern = rf'\b{re.escape(city)}[,\s]+{state_country_pattern}\b'
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                contact['location'] = f"{city}, {match.group(1)}"
+                break
     
     return contact
 
@@ -1401,6 +1415,9 @@ def extract_experiences(text: str) -> List[Dict]:
                                     continue
                                 if re.match(r'^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', emp_line, re.IGNORECASE):
                                     continue
+                                # Skip Client: lines - Pattern 12 handles those
+                                if emp_line.lower().startswith('client:'):
+                                    continue
                                 if len(emp_line) > 3 and len(emp_line) < 100:
                                     if emp_line.upper() not in ['WORK EXPERIENCE', 'EXPERIENCE', 'PROFESSIONAL EXPERIENCE', 'ROLES & RESPONSIBILITIES']:
                                         dm = re.search(date_pattern, emp_line, re.IGNORECASE)
@@ -1608,6 +1625,11 @@ def extract_experiences(text: str) -> List[Dict]:
             i += 1
             continue
         
+        # Skip Client: format lines - Pattern 12 handles those better
+        if line_stripped.lower().startswith('client:'):
+            i += 1
+            continue
+        
         date_match = re.search(date_pattern, line_stripped, re.IGNORECASE)
         
         if date_match:
@@ -1797,6 +1819,7 @@ def extract_experiences(text: str) -> List[Dict]:
     
     # =========================================================================
     # PATTERN 12: "Client: X / Role: Y" (Venkata/SAP consultant format)
+    # Also handles "Client: X, Location \t\t Date Range" (Richie format)
     # =========================================================================
     i = 0
     while i < len(lines):
@@ -1805,46 +1828,88 @@ def extract_experiences(text: str) -> List[Dict]:
         # Look for "Client:" line
         client_match = re.match(r'^Client:\s*(.+)$', line, re.IGNORECASE)
         if client_match:
-            employer = client_match.group(1).strip()
+            full_client_line = client_match.group(1).strip()
+            employer = full_client_line
             title = None
             start_year = end_year = start_month = end_month = None
             is_present = False
+            resp_start_line = i + 1
             
-            # Look for Role and dates in next few lines
+            # First check if dates are on the SAME line as Client:
+            # Format: "Caterpillar Inc., Peoria, IL\t\t\tJuly 2021 – Oct 2023"
+            same_line_date = re.search(
+                r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*(\d{4})\s*[-–to]+\s*(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|Present|Current|Till)\w*\s*(\d{4})?',
+                full_client_line, re.IGNORECASE
+            )
+            
+            if same_line_date:
+                # Extract employer (before the date)
+                employer = full_client_line[:same_line_date.start()].strip().rstrip('\t')
+                start_year, start_month, _ = parse_date(f"{same_line_date.group(1)} {same_line_date.group(2)}")
+                end_str = same_line_date.group(3)
+                if end_str.lower() in ['present', 'current', 'till']:
+                    end_year = datetime.now().year
+                    end_month = datetime.now().month
+                    is_present = True
+                else:
+                    end_year_str = same_line_date.group(4) or str(datetime.now().year)
+                    end_year, end_month, is_present = parse_date(f"{end_str} {end_year_str}")
+            
+            # Look for Role/Title and dates in next few lines
             for j in range(i+1, min(i+8, len(lines))):
                 next_line = lines[j].strip()
                 
                 # Role line
-                role_match = re.match(r'^Role:\s*(.+)$', next_line, re.IGNORECASE)
-                if role_match:
-                    title = role_match.group(1).strip()
+                role_match = re.match(r'^(?:Role|Senior|Sr\.?|Jr\.?)\s*[:]?\s*(.+)$', next_line, re.IGNORECASE)
+                if role_match and not title:
+                    potential_title = role_match.group(1).strip() if next_line.startswith(('Role', 'role')) else next_line
+                    # Verify it's a title, not a description
+                    if len(potential_title) < 60 and not potential_title.startswith(('Project', 'Description', 'Responsibilities')):
+                        title = potential_title
+                        resp_start_line = j + 1
                 
-                # Date patterns - various formats
-                # "January 2013 to August 2015" or "Apr 2019 - Present"
-                date_match = re.search(
-                    r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*(\d{4})\s*(?:to|[-–])\s*(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|Present|Current|Till)\s*(\d{4})?',
-                    next_line, re.IGNORECASE
-                )
-                if date_match:
-                    start_year, start_month, _ = parse_date(f"{date_match.group(1)} {date_match.group(2)}")
-                    end_str = date_match.group(3)
-                    if end_str.lower() in ['present', 'current', 'till']:
-                        end_year = datetime.now().year
-                        end_month = datetime.now().month
-                        is_present = True
-                    else:
-                        end_year_str = date_match.group(4) or str(datetime.now().year)
-                        end_year, end_month, is_present = parse_date(f"{end_str} {end_year_str}")
-                    break
+                # Title on line after Client (if no Role: prefix)
+                if j == i + 1 and not title and not next_line.startswith(('Project', 'Description', 'Role', 'Responsibilities')):
+                    if len(next_line) < 60 and re.search(r'(Consultant|Engineer|Developer|Manager|Analyst|Lead|Architect)', next_line, re.IGNORECASE):
+                        title = next_line
+                        resp_start_line = j + 1
+                
+                # Check for "Responsibilities:" header
+                if re.match(r'^Responsibilities\s*:', next_line, re.IGNORECASE):
+                    resp_start_line = j + 1
+                
+                # Date patterns (if not found on same line)
+                if not start_year:
+                    date_match = re.search(
+                        r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*(\d{4})\s*(?:to|[-–])\s*(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|Present|Current|Till)\s*(\d{4})?',
+                        next_line, re.IGNORECASE
+                    )
+                    if date_match:
+                        start_year, start_month, _ = parse_date(f"{date_match.group(1)} {date_match.group(2)}")
+                        end_str = date_match.group(3)
+                        if end_str.lower() in ['present', 'current', 'till']:
+                            end_year = datetime.now().year
+                            end_month = datetime.now().month
+                            is_present = True
+                        else:
+                            end_year_str = date_match.group(4) or str(datetime.now().year)
+                            end_year, end_month, is_present = parse_date(f"{end_str} {end_year_str}")
             
-            # If no dates found, try to infer from position (most recent first)
+            # If no dates found but this looks like current job (first Client: entry), assume Present
             if not start_year:
-                # Skip if no dates - will be caught by AI enhancement
-                i += 1
-                continue
+                # Check if this might be the most recent job (no dates = current)
+                if i < 50:  # Near top of experience section
+                    start_year = datetime.now().year - 1  # Assume started last year
+                    start_month = 1
+                    end_year = datetime.now().year
+                    end_month = datetime.now().month
+                    is_present = True
+                else:
+                    i += 1
+                    continue
             
-            # Extract responsibilities
-            responsibilities = extract_responsibilities(lines, i + 1, i + 25)
+            # Extract responsibilities - start from after title/role line
+            responsibilities = extract_responsibilities(lines, resp_start_line, resp_start_line + 30)
             
             if start_year and end_year:
                 duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
@@ -1871,7 +1936,148 @@ def extract_experiences(text: str) -> List[Dict]:
                     })
         i += 1
     
-    # Sort by start date (most recent first)
+        # =========================================================================
+    # PATTERN 13: Pipe-separated format "Date | Employer, Location | Title" (Jacques format)
+    # =========================================================================
+    # Example: "Jun. 2015 –Present | Fabrinet, Santa Clara, CA | Solution Architect"
+    pipe_pattern = re.compile(
+        r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[.\s]*\s*(\d{4})\s*[–\-—to]+\s*'
+        r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Present|Current)[.\s]*\s*(\d{4})?\s*\|\s*'
+        r'([^|]+)\s*\|\s*(.+)$',
+        re.IGNORECASE
+    )
+    
+    for i, line in enumerate(lines):
+        match = pipe_pattern.match(line.strip())
+        if match:
+            start_month_str = match.group(1)
+            start_year = int(match.group(2))
+            end_month_str = match.group(3)
+            end_year_str = match.group(4)
+            employer_loc = match.group(5).strip()
+            title = match.group(6).strip()
+            
+            # Parse employer and location
+            if ',' in employer_loc:
+                parts = employer_loc.rsplit(',', 1)
+                employer = parts[0].strip()
+                location = parts[-1].strip() if len(parts) > 1 else None
+            else:
+                employer = employer_loc
+                location = None
+            
+            # Parse dates
+            start_year, start_month, _ = parse_date(f"{start_month_str} {start_year}")
+            
+            if end_month_str.lower() in ['present', 'current']:
+                end_year = datetime.now().year
+                end_month = datetime.now().month
+                is_present = True
+            else:
+                end_year = int(end_year_str) if end_year_str else datetime.now().year
+                end_year, end_month, is_present = parse_date(f"{end_month_str} {end_year}")
+            
+            # Extract responsibilities from following lines
+            responsibilities = extract_responsibilities(lines, i + 1, min(i + 50, len(lines)))
+            
+            duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
+            start_date = f"{start_year}-{(start_month or 1):02d}"
+            end_date = f"{end_year}-{(end_month or 12):02d}"
+            
+            # Check for duplicates
+            is_dup = any(
+                e.get('start_date') == start_date and
+                employer.lower() in (e.get('employer') or '').lower()
+                for e in experiences
+            )
+            
+            if not is_dup:
+                experiences.append({
+                    'employer': employer,
+                    'title': title,
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'duration_months': duration,
+                    'responsibilities': responsibilities[:12],
+                    'location': location,
+                    'pattern': 13
+                })
+    
+    # =========================================================================
+    # PATTERN 14: Tab-separated "Employer, Location \t\t Date" (Parth format)
+    # =========================================================================
+    # Example: "Accenture, New York, NY\t\t\t Jan 2019 - Present"
+    tab_pattern = re.compile(
+        r'^([A-Za-z][A-Za-z0-9\s&.,/-]+?)\s*[,]\s*([A-Za-z\s]+,?\s*[A-Z]{2})?\s*[\t]{2,}\s*'
+        r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s*(\d{4})\s*[-–—to]+\s*'
+        r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Present|Current)[a-z]*\s*(\d{4})?',
+        re.IGNORECASE
+    )
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        match = tab_pattern.match(line)
+        
+        if match:
+            employer = match.group(1).strip()
+            location = match.group(2).strip() if match.group(2) else None
+            start_month_str = match.group(3)
+            start_year = int(match.group(4))
+            end_month_str = match.group(5)
+            end_year_str = match.group(6)
+            
+            # Get title from next line
+            title = None
+            if i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                # Title line should not be a section header or responsibility
+                if next_line and not next_line.startswith(('Key ', 'Role:', '•', '-', '*')):
+                    if not re.match(r'^(EDUCATION|SKILLS|CERTIFICATION|SUMMARY)', next_line, re.IGNORECASE):
+                        title = next_line
+            
+            # Parse dates
+            start_year, start_month, _ = parse_date(f"{start_month_str} {start_year}")
+            
+            if end_month_str.lower() in ['present', 'current']:
+                end_year = datetime.now().year
+                end_month = datetime.now().month
+                is_present = True
+            else:
+                end_year = int(end_year_str) if end_year_str else datetime.now().year
+                end_year, end_month, is_present = parse_date(f"{end_month_str} {end_year}")
+            
+            # Extract responsibilities - look for "Key Responsibilities" section
+            resp_start = i + 2
+            responsibilities = extract_responsibilities(lines, resp_start, min(resp_start + 40, len(lines)))
+            
+            duration = calculate_duration(start_year, start_month or 1, end_year, end_month or 12)
+            start_date = f"{start_year}-{(start_month or 1):02d}"
+            end_date = f"{end_year}-{(end_month or 12):02d}"
+            
+            # Check for duplicates
+            is_dup = any(
+                e.get('start_date') == start_date and
+                employer.lower() in (e.get('employer') or '').lower()
+                for e in experiences
+            )
+            
+            if not is_dup:
+                experiences.append({
+                    'employer': employer,
+                    'title': title,
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'duration_months': duration,
+                    'responsibilities': responsibilities[:12],
+                    'location': location,
+                    'pattern': 14
+                })
+        i += 1
+    
+    
+    
+        # Sort by start date (most recent first)
     experiences.sort(key=lambda x: x.get('start_date', ''), reverse=True)
     
     # Remove pattern field and filter/clean invalid entries
@@ -1897,11 +2103,30 @@ def extract_experiences(text: str) -> List[Dict]:
             employer = employer[7:].strip()
             exp['employer'] = employer
         
-        # Remove duplicate entries (same employer + start_date)
-        key = (employer.lower(), exp.get('start_date', ''))
-        if key in seen:
+        # Remove duplicate entries (same employer base + similar date)
+        # Normalize employer: take first word or before comma
+        employer_norm = employer.split(',')[0].strip().lower()
+        employer_first_word = employer_norm.split()[0] if employer_norm.split() else ''
+        start_date = exp.get('start_date', '')
+        
+        # Check for duplicates using normalized employer
+        is_dup = False
+        for seen_emp, seen_date in seen:
+            # Same start date and similar employer name
+            if seen_date == start_date:
+                if (seen_emp == employer_norm or 
+                    seen_emp.startswith(employer_first_word) or 
+                    employer_norm.startswith(seen_emp.split()[0] if seen_emp.split() else '')):
+                    is_dup = True
+                    break
+        
+        if is_dup:
             continue
-        seen.add(key)
+        seen.add((employer_norm, start_date))
+        
+        # Normalize 'employer' to 'Employer' for output consistency
+        if 'employer' in exp:
+            exp['Employer'] = exp.pop('employer')
         
         valid_experiences.append(exp)
     
@@ -2028,7 +2253,34 @@ def extract_education(text: str) -> List[Dict]:
                         'year': entry.get('year')
                     })
     
-    return education
+    # Post-process: Extract institution from degree string if missing
+    for edu in education:
+        if not edu.get('institution') and edu.get('degree'):
+            degree = edu['degree']
+            
+            # Pattern 1: "..., University of X, ..."
+            univ_match = re.search(r',\s*(University\s+of\s+[^,]+|[A-Z][a-z]+\s+University[^,]*)', degree)
+            if univ_match:
+                edu['institution'] = univ_match.group(1).strip().rstrip('.')
+                edu['degree'] = degree[:univ_match.start()].strip().rstrip(',')
+                continue
+            
+            # Pattern 2: "... from University"
+            from_match = re.search(r'(.+?)\s+(?:from|at)\s+([^,]+University[^,]*)', degree, re.IGNORECASE)
+            if from_match:
+                edu['degree'] = from_match.group(1).strip()
+                edu['institution'] = from_match.group(2).strip().rstrip('.')
+                continue
+            
+            # Pattern 3: Just look for University in comma-separated parts
+            parts = [p.strip() for p in degree.split(',')]
+            for i, part in enumerate(parts):
+                if 'university' in part.lower() or 'college' in part.lower() or 'institute' in part.lower():
+                    edu['institution'] = part.strip().rstrip('.')
+                    edu['degree'] = ', '.join(parts[:i]).strip()
+                    break
+    
+    return education[:10]
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -2375,7 +2627,7 @@ def validation_agent(parsed: Dict, text: str) -> ValidationResult:
     
     if experiences:
         total_resp = sum(len(e.get("responsibilities", [])) for e in experiences)
-        jobs_without_employer = sum(1 for e in experiences if not e.get("Employer"))
+        jobs_without_employer = sum(1 for e in experiences if not (e.get("employer") or e.get("Employer")))
         jobs_without_title = sum(1 for e in experiences if not e.get("title"))
         jobs_without_dates = sum(1 for e in experiences if not e.get("start_date"))
         jobs_without_resp = sum(1 for e in experiences if not e.get("responsibilities"))
@@ -2554,6 +2806,494 @@ def validation_agent(parsed: Dict, text: str) -> ValidationResult:
 # ║                    AI ENHANCEMENT AGENT (v8.5 - Comprehensive)               ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                    AGENTIC SELF-HEALING SYSTEM (v8.7.0)                      ║
+# ╠══════════════════════════════════════════════════════════════════════════════╣
+# ║  This system ensures the parser works with ANY resume format by:             ║
+# ║  1. Pattern Detection - Identifies resume format patterns                    ║
+# ║  2. Gap Analysis - Compares detected vs extracted fields                     ║
+# ║  3. Targeted AI Fix - Uses AI only for missing fields                        ║
+# ║  4. Quality Validation - Ensures AI output meets standards                   ║
+# ║  5. Failure Logging - Records issues for future pattern improvement          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+class AgenticOrchestrator:
+    """
+    Central orchestrator for the agentic resume parsing system.
+    Coordinates between detection, extraction, diagnosis, and AI enhancement.
+    """
+    
+    def __init__(self, text: str, filename: str):
+        self.text = text
+        self.filename = filename
+        self.diagnosis = None
+        self.extraction_result = None
+        self.ai_attempts = 0
+        self.max_ai_attempts = 2
+        self.failure_log = []
+    
+    def detect_format(self) -> Dict:
+        """
+        Agent 1: Format Detection
+        Analyzes the resume to understand its structure.
+        """
+        format_info = {
+            "type": "unknown",
+            "patterns_detected": [],
+            "structure": {},
+            "confidence": 0.0
+        }
+        
+        lines = self.text.split('\n')[:50]  # First 50 lines
+        
+        # Detect pipe-separated format (Jacques style)
+        pipe_lines = sum(1 for l in lines if '|' in l and re.search(r'\d{4}', l))
+        if pipe_lines >= 3:
+            format_info["patterns_detected"].append("pipe_separated")
+            format_info["type"] = "pipe_structured"
+        
+        # Detect Client:/Role: format
+        client_lines = sum(1 for l in lines if re.match(r'^Client:', l, re.I))
+        if client_lines >= 2:
+            format_info["patterns_detected"].append("client_role")
+            format_info["type"] = "consultant_format"
+        
+        # Detect Project:/Duration: format
+        project_lines = sum(1 for l in lines if re.match(r'^Project\s*:', l, re.I))
+        if project_lines >= 2:
+            format_info["patterns_detected"].append("project_duration")
+            format_info["type"] = "project_based"
+        
+        # Detect table format (tabs/multiple spaces)
+        tab_lines = sum(1 for l in lines if '\t' in l or '    ' in l)
+        if tab_lines >= 5:
+            format_info["patterns_detected"].append("tabular")
+        
+        # Detect standard chronological
+        date_lines = sum(1 for l in lines if re.search(r'(19|20)\d{2}\s*[-–to]+\s*(19|20|Present|Current)', l, re.I))
+        if date_lines >= 3:
+            format_info["patterns_detected"].append("chronological")
+        
+        # Calculate confidence
+        format_info["confidence"] = min(1.0, len(format_info["patterns_detected"]) * 0.3)
+        
+        return format_info
+    
+    def analyze_gaps(self) -> Dict:
+        """
+        Agent 2: Gap Analysis
+        Compares what patterns detected vs what was actually extracted.
+        """
+        if not self.diagnosis:
+            self.diagnosis = diagnose_extraction(self.text, self.filename)
+        
+        gaps = {
+            "critical_missing": [],
+            "important_missing": [],
+            "minor_missing": [],
+            "extraction_failures": []
+        }
+        
+        results = self.diagnosis.get("extraction_results", {})
+        patterns = self.diagnosis.get("raw_patterns_found", {})
+        
+        # Critical fields
+        if not results.get("name") or len(str(results.get("name", "")).split()) < 2:
+            if patterns.get("name", {}).get("all_caps_name") or patterns.get("name", {}).get("title_case_name"):
+                gaps["extraction_failures"].append("name")
+            gaps["critical_missing"].append("name")
+        
+        if not results.get("email"):
+            if patterns.get("contact", {}).get("email"):
+                gaps["extraction_failures"].append("email")
+            gaps["critical_missing"].append("email")
+        
+        if results.get("experience_count", 0) == 0:
+            if any(patterns.get("experience", {}).values()):
+                gaps["extraction_failures"].append("experience")
+            gaps["critical_missing"].append("experience")
+        
+        # Important fields
+        if not results.get("phone"):
+            if patterns.get("contact", {}).get("phone_standard") or patterns.get("contact", {}).get("phone_intl"):
+                gaps["extraction_failures"].append("phone")
+            gaps["important_missing"].append("phone")
+        
+        if results.get("education_count", 0) == 0:
+            if patterns.get("education", {}).get("degree_keyword"):
+                gaps["extraction_failures"].append("education")
+            gaps["important_missing"].append("education")
+        
+        if results.get("total_responsibilities", 0) < 10:
+            gaps["important_missing"].append("responsibilities")
+        
+        # Minor fields
+        if results.get("certification_count", 0) == 0:
+            if patterns.get("certifications", {}).get("certified_keyword"):
+                gaps["extraction_failures"].append("certifications")
+            gaps["minor_missing"].append("certifications")
+        
+        return gaps
+    
+    def build_targeted_prompt(self, gaps: Dict) -> str:
+        """
+        Agent 3: Prompt Builder
+        Creates a focused prompt for AI based on specific gaps.
+        """
+        prompt_parts = []
+        
+        # Add context about what we need
+        prompt_parts.append("Extract ONLY the following missing information from this resume:")
+        prompt_parts.append("")
+        
+        # Critical missing
+        if "name" in gaps.get("critical_missing", []):
+            prompt_parts.append("1. FULL NAME (first and last name, look at the very top of the resume)")
+        
+        if "experience" in gaps.get("critical_missing", []) or "experience" in gaps.get("extraction_failures", []):
+            prompt_parts.append("""
+2. WORK EXPERIENCE - Extract ALL jobs with:
+   - employer: Company name
+   - title: Job title
+   - start_date: YYYY-MM format
+   - end_date: YYYY-MM format (or "Present")
+   - responsibilities: List of 3-5 key responsibilities
+   
+   Look for patterns like:
+   - "Company Name | Title | Date"
+   - "Client: Company" followed by "Role: Title"
+   - Company names followed by dates
+""")
+        
+        # Important missing
+        if "phone" in gaps.get("important_missing", []):
+            prompt_parts.append("3. PHONE NUMBER (any format: +1, parentheses, dashes)")
+        
+        if "education" in gaps.get("important_missing", []):
+            prompt_parts.append("""
+4. EDUCATION - Extract:
+   - degree: Full degree name
+   - institution: University/College name
+   - year: Graduation year
+""")
+        
+        if "responsibilities" in gaps.get("important_missing", []):
+            prompt_parts.append("""
+5. JOB RESPONSIBILITIES - For each job, extract:
+   - Key achievements and duties
+   - Technical skills used
+   - Projects completed
+   Look for bullet points, action verbs (Led, Developed, Implemented, etc.)
+""")
+        
+        prompt_parts.append("")
+        prompt_parts.append("Return ONLY a JSON object with the extracted fields. Do not include fields that are already extracted or not found.")
+        
+        return "\n".join(prompt_parts)
+    
+    async def run_targeted_ai_fix(self, gaps: Dict, current_result: Dict) -> Dict:
+        """
+        Agent 4: Targeted AI Fixer
+        Uses AI to extract only missing fields.
+        """
+        if not ANTHROPIC_API_KEY:
+            return current_result
+        
+        if self.ai_attempts >= self.max_ai_attempts:
+            self.failure_log.append(f"Max AI attempts ({self.max_ai_attempts}) reached")
+            return current_result
+        
+        self.ai_attempts += 1
+        
+        # Build targeted prompt
+        prompt = self.build_targeted_prompt(gaps)
+        
+        # Prepare text excerpt (first 4000 chars for context)
+        text_excerpt = self.text[:4000]
+        
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json"
+                    },
+                    json={
+                        "model": "claude-sonnet-4-20250514",
+                        "max_tokens": 2000,
+                        "messages": [{
+                            "role": "user",
+                            "content": f"{prompt}\n\n---RESUME TEXT---\n{text_excerpt}"
+                        }]
+                    }
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    ai_text = data.get("content", [{}])[0].get("text", "")
+                    
+                    # Parse AI response
+                    ai_result = self._parse_ai_response(ai_text)
+                    
+                    # Merge with current result
+                    current_result = self._merge_ai_result(current_result, ai_result, gaps)
+                    
+        except Exception as e:
+            self.failure_log.append(f"AI call failed: {str(e)}")
+        
+        return current_result
+    
+    def _parse_ai_response(self, ai_text: str) -> Dict:
+        """Parse AI response, handling various formats."""
+        try:
+            # Try to find JSON in response
+            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', ai_text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+        except:
+            pass
+        
+        # Fallback: extract key-value pairs
+        result = {}
+        
+        # Extract name
+        name_match = re.search(r'name["\'\s:]+([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)', ai_text)
+        if name_match:
+            result["name"] = name_match.group(1)
+        
+        # Extract phone
+        phone_match = re.search(r'phone["\'\s:]+([+\d\s\-().]+)', ai_text)
+        if phone_match:
+            result["phone"] = phone_match.group(1).strip()
+        
+        return result
+    
+    def _merge_ai_result(self, current: Dict, ai_result: Dict, gaps: Dict) -> Dict:
+        """Merge AI result into current result, only for missing fields."""
+        pr = current.get("parsed_resume", {})
+        
+        # Only update truly missing fields
+        if "name" in gaps.get("critical_missing", []) and ai_result.get("name"):
+            name_parts = ai_result["name"].split()
+            if len(name_parts) >= 2:
+                pr["firstname"] = name_parts[0]
+                pr["lastname"] = name_parts[-1]
+                pr["name"] = ai_result["name"]
+        
+        if "phone" in gaps.get("important_missing", []) and ai_result.get("phone"):
+            pr["phone_number"] = ai_result["phone"]
+        
+        if ai_result.get("experience") and isinstance(ai_result["experience"], list):
+            # Add AI-extracted experience only if we have very few
+            if len(pr.get("experience", [])) < 3:
+                for exp in ai_result["experience"]:
+                    if isinstance(exp, dict) and exp.get("employer"):
+                        pr["experience"].append({
+                            "Employer": exp.get("employer"),
+                            "title": exp.get("title"),
+                            "start_date": exp.get("start_date"),
+                            "end_date": exp.get("end_date"),
+                            "responsibilities": exp.get("responsibilities", []),
+                            "ai_extracted": True
+                        })
+        
+        if ai_result.get("education") and isinstance(ai_result["education"], list):
+            if len(pr.get("education", [])) == 0:
+                pr["education"] = ai_result["education"]
+        
+        current["parsed_resume"] = pr
+        current["ai_enhanced"] = True
+        
+        return current
+    
+    def log_failure(self, issue: str, context: Dict = None):
+        """Log parsing failures for future improvement."""
+        self.failure_log.append({
+            "issue": issue,
+            "filename": self.filename,
+            "context": context,
+            "timestamp": datetime.now().isoformat()
+        })
+    
+    def get_failure_report(self) -> List:
+        """Get all logged failures."""
+        return self.failure_log
+
+
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                    QUALITY ASSURANCE SYSTEM                                  ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+class QualityAssurance:
+    """
+    Ensures parsing quality meets standards.
+    Implements automatic retry and escalation logic.
+    """
+    
+    MIN_ACCEPTABLE_SCORE = 70
+    MIN_GOOD_SCORE = 85
+    
+    CRITICAL_FIELDS = ["name", "email", "experience"]
+    IMPORTANT_FIELDS = ["phone_number", "education", "technical_skills"]
+    
+    @classmethod
+    def assess_quality(cls, result: Dict) -> Dict:
+        """Assess the quality of parsing result."""
+        pr = result.get("parsed_resume", {})
+        score = result.get("validation_score", 0)
+        
+        assessment = {
+            "score": score,
+            "grade": cls._score_to_grade(score),
+            "critical_fields_present": {},
+            "important_fields_present": {},
+            "recommendations": [],
+            "needs_retry": False,
+            "needs_manual_review": False
+        }
+        
+        # Check critical fields
+        for field in cls.CRITICAL_FIELDS:
+            value = pr.get(field)
+            if field == "experience":
+                present = len(value or []) > 0
+            else:
+                present = bool(value)
+            assessment["critical_fields_present"][field] = present
+            
+            if not present:
+                assessment["recommendations"].append(f"Missing critical field: {field}")
+                assessment["needs_retry"] = True
+        
+        # Check important fields
+        for field in cls.IMPORTANT_FIELDS:
+            value = pr.get(field)
+            if isinstance(value, list):
+                present = len(value) > 0
+            else:
+                present = bool(value)
+            assessment["important_fields_present"][field] = present
+        
+        # Check experience quality
+        experiences = pr.get("experience", [])
+        if experiences:
+            total_resp = sum(len(e.get("responsibilities", [])) for e in experiences)
+            if total_resp < 5:
+                assessment["recommendations"].append("Very few responsibilities extracted")
+                assessment["needs_retry"] = True
+            
+            employers_missing = sum(1 for e in experiences if not (e.get("Employer") or e.get("employer")))
+            if employers_missing > len(experiences) // 2:
+                assessment["recommendations"].append("Many jobs missing employer names")
+                assessment["needs_retry"] = True
+        
+        # Determine if manual review needed
+        if score < 50:
+            assessment["needs_manual_review"] = True
+            assessment["recommendations"].append("Score too low - may need manual review or new pattern")
+        
+        return assessment
+    
+    @classmethod
+    def _score_to_grade(cls, score: int) -> str:
+        if score >= 95:
+            return "A+"
+        elif score >= 90:
+            return "A"
+        elif score >= 85:
+            return "B+"
+        elif score >= 80:
+            return "B"
+        elif score >= 70:
+            return "C"
+        elif score >= 60:
+            return "D"
+        else:
+            return "F"
+    
+    @classmethod
+    async def ensure_quality(cls, text: str, filename: str, max_retries: int = 2) -> Dict:
+        """
+        Main quality assurance function.
+        Retries with AI if quality is insufficient.
+        """
+        # First attempt without AI
+        result = await parse_resume(text, filename, use_ai=False)
+        assessment = cls.assess_quality(result)
+        
+        retry_count = 0
+        
+        while assessment["needs_retry"] and retry_count < max_retries and ANTHROPIC_API_KEY:
+            retry_count += 1
+            
+            # Use agentic parsing with AI
+            result = await agentic_parse(text, filename, use_ai=True)
+            assessment = cls.assess_quality(result)
+            
+            # If score improved significantly, we're done
+            if result.get("validation_score", 0) >= cls.MIN_ACCEPTABLE_SCORE:
+                break
+        
+        result["quality_assessment"] = assessment
+        result["retry_count"] = retry_count
+        
+        return result
+
+
+async def smart_parse(text: str, filename: str) -> Dict:
+    """
+    Smart parsing with automatic quality assurance.
+    This is the recommended function for production use.
+    """
+    return await QualityAssurance.ensure_quality(text, filename)
+
+
+
+async def agentic_parse(text: str, filename: str, use_ai: bool = True) -> Dict:
+    """
+    Main agentic parsing function.
+    Orchestrates all agents to ensure robust parsing.
+    """
+    orchestrator = AgenticOrchestrator(text, filename)
+    
+    # Step 1: Detect format
+    format_info = orchestrator.detect_format()
+    
+    # Step 2: Run standard extraction
+    result = await parse_resume(text, filename, use_ai=False)
+    
+    # Step 3: Analyze gaps
+    gaps = orchestrator.analyze_gaps()
+    
+    # Step 4: If gaps exist and AI is enabled, run targeted fix
+    has_critical_gaps = len(gaps.get("critical_missing", [])) > 0
+    has_extraction_failures = len(gaps.get("extraction_failures", [])) > 0
+    
+    if use_ai and (has_critical_gaps or has_extraction_failures):
+        result = await orchestrator.run_targeted_ai_fix(gaps, result)
+        
+        # Re-validate after AI fix
+        validation = validation_agent(result, text)
+        result["validation_score"] = validation.score
+        result["validation_issues"] = validation.issues
+    
+    # Add metadata
+    result["agentic_metadata"] = {
+        "format_detected": format_info,
+        "gaps_analyzed": gaps,
+        "ai_attempts": orchestrator.ai_attempts,
+        "failures": orchestrator.failure_log
+    }
+    
+    return result
+
+
+
 async def ai_enhancement_agent(text: str, parsed: Dict, validation: ValidationResult) -> Dict:
     """
     Use Claude API to extract/fix ALL missing or low-quality fields.
@@ -2582,7 +3322,7 @@ async def ai_enhancement_agent(text: str, parsed: Dict, validation: ValidationRe
         job_list = ""
         if existing_jobs:
             job_list = "EXISTING JOBS FOUND:\n" + "\n".join([
-                f"- {j.get('Employer', 'Unknown')}: {j.get('title', 'Unknown')} ({j.get('start_date', '?')} - {j.get('end_date', '?')})" 
+                f"- {j.get('employer', 'Unknown')}: {j.get('title', 'Unknown')} ({j.get('start_date', '?')} - {j.get('end_date', '?')})" 
                 for j in existing_jobs
             ])
         
@@ -3002,7 +3742,7 @@ async def parse_resume(text: str, filename: str = None, use_ai: bool = True) -> 
             "certifications": certifications,
             "experience": [
                 {
-                    "Employer": e.get('employer'),
+                    "Employer": e.get('Employer') or e.get('employer'),
                     "title": e.get('title'),
                     "location": e.get('location'),
                     "start_date": e.get('start_date'),
@@ -3216,4 +3956,103 @@ async def debug_text_extraction(file: UploadFile = File(...)):
         "first_20_lines": [l.strip()[:80] for l in lines[:20]],
         "all_caps_candidates": all_caps_lines[:10],
         "extracted_name": {"first": first, "middle": middle, "last": last, "full": ' '.join(filter(None, [first, middle, last]))}
+    }@app.post("/parse/smart")
+async def parse_resume_smart(
+    file: UploadFile = File(...)
+):
+    """
+    Smart resume parsing with automatic quality assurance.
+    
+    This endpoint:
+    1. Tries pattern-based extraction first
+    2. Automatically retries with AI if quality is low
+    3. Returns quality assessment with recommendations
+    
+    Recommended for production use.
+    """
+    content = await file.read()
+    filename = file.filename or "unknown"
+    
+    file_type = detect_file_type(content, filename)
+    text = extract_text_intelligent(content, filename)
+    
+    if len(text) < 100:
+        return {
+            "error": f"Insufficient text extracted ({len(text)} chars)",
+            "file_type": file_type,
+            "suggestion": "Check file format"
+        }
+    
+    result = await smart_parse(text, filename)
+    
+    return result
+
+
+@app.get("/health/patterns")
+async def get_pattern_health():
+    """
+    Returns information about pattern coverage and health.
+    Use this to understand which patterns exist and their coverage.
+    """
+    patterns = {
+        "total_patterns": 15,
+        "patterns": [
+            {"id": 1, "name": "Standard date-range", "example": "Company Name | Jan 2020 - Present"},
+            {"id": 2, "name": "Worked-as format", "example": "Worked as Developer in Google from 2020 to 2023"},
+            {"id": 3, "name": "Table format", "example": "Client: X | Duration: Y"},
+            {"id": 4, "name": "Title-DateRange-Client", "example": "Developer (2020-2023) - Client - Employer"},
+            {"id": 5, "name": "Standard chronological", "example": "2020-2023: Company Name"},
+            {"id": 6, "name": "Bullet format", "example": "• Company: X | Period: 2020-2023"},
+            {"id": 7, "name": "ROLE/DESIGNATION keyword", "example": "ROLE: Developer"},
+            {"id": 8, "name": "Client with double-dash", "example": "**Client: Company -- Location Date**"},
+            {"id": 9, "name": "MM/YYYY format", "example": "01/2020 - 12/2023"},
+            {"id": 10, "name": "Markdown format", "example": "## Title | Company | Date"},
+            {"id": 11, "name": "Project/Client/Duration", "example": "Project: X | Client: Y | Duration: Z"},
+            {"id": 12, "name": "Client/Role format", "example": "Client: X | Role: Y"},
+            {"id": 13, "name": "Pipe-separated", "example": "Jun 2015 – Present | Company | Title"},
+            {"id": 14, "name": "Tab-separated", "example": "Company, Location [tabs] Date"},
+            {"id": 15, "name": "Client with tabs", "example": "Client: Company [tabs] Date"}
+        ],
+        "coverage": {
+            "consultant_resumes": ["11", "12", "15"],
+            "corporate_resumes": ["1", "2", "5", "9"],
+            "structured_resumes": ["3", "8", "13", "14"],
+            "markdown_resumes": ["10"]
+        }
     }
+    return patterns
+
+
+@app.post("/parse/agentic")
+async def parse_resume_agentic(
+    file: UploadFile = File(...),
+    use_ai: bool = True
+):
+    """
+    Agentic resume parsing endpoint.
+    Uses the self-healing agentic system for robust parsing of any format.
+    
+    Features:
+    - Format auto-detection
+    - Gap analysis
+    - Targeted AI fixes
+    - Failure logging
+    """
+    content = await file.read()
+    filename = file.filename or "unknown"
+    
+    # Detect file type and extract text
+    file_type = detect_file_type(content, filename)
+    text = extract_text_intelligent(content, filename)
+    
+    if len(text) < 100:
+        return {
+            "error": f"Insufficient text extracted ({len(text)} chars)",
+            "file_type": file_type,
+            "suggestion": "Check file format or use /debug/diagnosis"
+        }
+    
+    # Run agentic parsing
+    result = await agentic_parse(text, filename, use_ai=use_ai)
+    
+    return result
