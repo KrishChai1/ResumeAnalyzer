@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.9.0"
+VERSION = "8.9.1"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -2170,186 +2170,182 @@ def extract_experiences(text: str) -> List[Dict]:
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def extract_education(text: str) -> List[Dict]:
-    """Extract education from resume text (v8.6)."""
+    """Extract education from resume text (v8.9)."""
     education = []
     seen_degrees = set()
-
-    # Also check for university on a separate line after degree
     lines = text.split('\n')
+    
+    # Strategy 1: Look for "Education:" header followed by entries
     for i, line in enumerate(lines):
-        line_lower = line.lower().strip()
-        
-        # Check for "Education" header followed by University then Degree
-        if line_lower == 'education' and i + 2 < len(lines):
+        line_strip = line.strip().lower().rstrip(':')
+        if line_strip == 'education':
+            # Process following lines
+            for j in range(i + 1, min(i + 10, len(lines))):
+                edu_line = lines[j].strip()
+                if not edu_line:
+                    continue
+                # Stop at section headers
+                if re.match(r'^(CERTIFICATION|SKILLS|EXPERIENCE|WORK|PROJECT|TECHNICAL)', edu_line, re.IGNORECASE):
+                    break
+                
+                degree_keywords = ['bachelor', 'master', 'b.tech', 'm.tech', 'bsc', 'msc', 'mba', 
+                                  'b.e', 'm.e', 'phd', 'diploma', 'degree', 'engineering', 'science']
+                inst_keywords = ['university', 'college', 'institute', 'school']
+                
+                # Pipe-separated: "Degree | Institution | Date"
+                if '|' in edu_line:
+                    parts = [p.strip() for p in edu_line.split('|')]
+                    if len(parts) >= 2:
+                        degree = parts[0] if any(kw in parts[0].lower() for kw in degree_keywords) else None
+                        institution = None
+                        year = None
+                        
+                        for part in parts[1:]:
+                            if not institution and any(kw in part.lower() for kw in inst_keywords):
+                                institution = part
+                            year_match = re.search(r'(19|20)\d{2}', part)
+                            if year_match:
+                                year = year_match.group()
+                        
+                        if degree:
+                            key = (degree.lower()[:50], (institution or '').lower()[:50])
+                            if key not in seen_degrees:
+                                seen_degrees.add(key)
+                                education.append({
+                                    'degree': degree.rstrip('.'),
+                                    'institution': institution,
+                                    'year': year
+                                })
+                    continue
+                
+                # Comma-separated: "Degree, Institution, Location, Date"
+                parts = [p.strip() for p in edu_line.split(',')]
+                if len(parts) >= 2:
+                    degree = None
+                    institution = None
+                    year = None
+                    
+                    for part in parts:
+                        part_lower = part.lower()
+                        if not degree and any(kw in part_lower for kw in degree_keywords):
+                            degree = part
+                        elif not institution and any(kw in part_lower for kw in inst_keywords):
+                            institution = part
+                        year_match = re.search(r'(19|20)\d{2}', part)
+                        if year_match:
+                            year = year_match.group()
+                    
+                    if degree:
+                        key = (degree.lower()[:50], (institution or '').lower()[:50])
+                        if key not in seen_degrees:
+                            seen_degrees.add(key)
+                            education.append({
+                                'degree': degree.rstrip('.'),
+                                'institution': institution,
+                                'year': year
+                            })
+    
+    # Strategy 2: "Education" header then "University" then "Degree"
+    for i, line in enumerate(lines):
+        if line.strip().lower() == 'education' and i + 2 < len(lines):
             next_line = lines[i + 1].strip()
-            next_next_line = lines[i + 2].strip()
+            next_next = lines[i + 2].strip()
             
-            # Pattern: Education -> University Name -> Degree
-            if any(kw in next_line.lower() for kw in ['university', 'college', 'institute', 'school']):
-                institution = next_line
-                degree = next_next_line
+            if any(kw in next_line.lower() for kw in ['university', 'college', 'institute']):
+                year_match = re.search(r'(19|20)\d{2}', next_next)
+                year = year_match.group() if year_match else None
+                degree = re.sub(r':\s*(Spring|Summer|Fall|Winter)?\s*(19|20)?\d{2,4}', '', next_next).strip()
                 
-                # Extract year if present
-                year_match = re.search(r'(19|20)\d{2}', degree)
-                year = year_match.group(0) if year_match else None
-                
-                # Clean degree
-                degree = re.sub(r':\s*(Spring|Summer|Fall|Winter)?\s*(19|20)\d{2}', '', degree).strip()
-                
-                key = (degree.lower(), (institution or '').lower())
-                if key not in seen_degrees:
+                key = (degree.lower()[:50], next_line.lower()[:50])
+                if key not in seen_degrees and degree:
                     seen_degrees.add(key)
                     education.append({
                         'degree': degree,
-                        'institution': institution,
+                        'institution': next_line,
                         'year': year
                     })
     
+    # Strategy 3: Fallback - search for EDUCATION section
+    if not education:
+        edu_match = re.search(
+            r'(?:EDUCATION(?:AL)?\s*(?:QUALIFICATION|BACKGROUND)?|ACADEMIC\s*(?:QUALIFICATION)?)'
+            r'[:\s]*\n?(.+?)(?:\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nSKILLS|\nCERTIFI|\nEXPERIENCE|\nCLIENT:|\Z)',
+            text, re.IGNORECASE | re.DOTALL
+        )
         
-    # First check for pipe-separated format: "Education | Degree at/from University"
-    for line in text.split('\n'):
-        line = line.strip()
-        if line.lower().startswith('education') and '|' in line:
-            parts = line.split('|', 1)
-            if len(parts) >= 2:
-                edu_text = parts[1].strip()
-                # Parse "Master of Computer Application (M.C.A) at Osmania University, India"
-                at_match = re.search(r'(.+?)\s+at\s+(.+)', edu_text, re.IGNORECASE)
-                from_match = re.search(r'(.+?)\s+from\s+(.+)', edu_text, re.IGNORECASE)
+        if edu_match:
+            edu_section = edu_match.group(1)
+            for line in edu_section.split('\n'):
+                line = re.sub(r'^[•·\-\*]\s*', '', line).strip()
+                if not line or len(line) < 10:
+                    continue
+                if re.match(r'^(Worked|Working|Client:|Duration:|Tools|Role)', line, re.IGNORECASE):
+                    continue
                 
-                if at_match:
-                    education.append({
-                        'degree': at_match.group(1).strip(),
-                        'institution': at_match.group(2).strip(),
-                        'year': None
-                    })
-                elif from_match:
-                    education.append({
-                        'degree': from_match.group(1).strip(),
-                        'institution': from_match.group(2).strip(),
-                        'year': None
-                    })
-                else:
-                    education.append({
-                        'degree': edu_text,
-                        'institution': None,
-                        'year': None
-                    })
-    
-    if education:
-        return education
-    
-    edu_match = re.search(
-        r'(?:EDUCATION(?:AL)?\s*(?:QUALIFICATION|BACKGROUND)?|ACADEMIC\s*(?:QUALIFICATION)?)'
-        r'[:\s]*\n?(.+?)(?:\nPROFESSIONAL|\nWORK|\nTECHNICAL|\nSKILLS|\nCERTIFI|\nEXPERIENCE|\nCLIENT:|\Z)',
-        text, re.IGNORECASE | re.DOTALL
-    )
-    
-    if edu_match:
-        edu_section = edu_match.group(1)
-        lines = [l.strip() for l in edu_section.split('\n') if l.strip()]
-        
-        for line in lines:
-            # Strip bullet points
-            line = re.sub(r'^[•·\-\*]\s*', '', line).strip()
-            if not line:
-                continue
-            # Skip non-education lines
-            if re.match(r'^(Worked|Working|PROFESSIONAL|Client:|Duration:|Tools|Brief|Role|Environment)', line, re.IGNORECASE):
-                continue
-            # Skip lines that look like job descriptions
-            if 'Bank' in line and 'Duration' in line:
-                continue
-            if re.match(r'^\|', line):
-                continue
-            
-            entry = {}
-            
-            if line.count('|') >= 2:
-                parts = [p.strip() for p in line.split('|')]
-                entry['degree'] = parts[0]
-                # Find year and institution - year is typically in middle, institution at end
-                entry['institution'] = parts[-1] if not re.match(r'^\d{4}$', parts[-1].strip()) else None
-                for p in parts[1:]:
-                    year_match = re.search(r'(\d{4})', p)
+                # Simple extraction
+                degree_match = re.search(r'(Bachelor|Master|B\.?Tech|M\.?Tech|MBA|PhD|Diploma)[^,]*', line, re.IGNORECASE)
+                if degree_match:
+                    degree = degree_match.group(0).strip()
+                    institution = None
+                    year = None
+                    
+                    # Find institution
+                    inst_match = re.search(r'(University|College|Institute)[^,|]*', line, re.IGNORECASE)
+                    if inst_match:
+                        institution = inst_match.group(0).strip()
+                    
+                    # Find year
+                    year_match = re.search(r'(19|20)\d{2}', line)
                     if year_match:
-                        entry['year'] = year_match.group(1)
-                        # If institution not set and this isn't the year-only part
-                        if not entry.get('institution') and len(parts) >= 3:
-                            entry['institution'] = parts[-1]
-                        break
-            
-            elif '|' in line and ('–' in line or '-' in line):
-                dash_match = re.match(r'^(.+?)\s*[-–]\s*(.+?)\s*\|\s*(\d{4})\s*[-–]\s*(\d{4})', line)
-                if dash_match:
-                    entry['degree'] = dash_match.group(1).strip()
-                    entry['institution'] = dash_match.group(2).strip()
-                    entry['year'] = dash_match.group(4)
-            
-            elif re.search(r'\bfrom\b', line, re.IGNORECASE):
-                from_match = re.match(r'^(.+?)\s+[Ff]rom\s+(.+?)\s+(\d{4})', line)
-                if from_match:
-                    entry['degree'] = from_match.group(1).strip()
-                    entry['institution'] = from_match.group(2).strip()
-                    entry['year'] = from_match.group(3)
-            
-            else:
-                degree_patterns = [r'\bmaster', r'\bbachelor', r'\bmba\b', r'\bmca\b', 
-                                  r'\bb\.?tech\b', r'\bm\.?tech\b', r'\bb\.?e\b', r'\bm\.?e\b']
-                if any(re.search(p, line.lower()) for p in degree_patterns):
-                    parts = re.split(r'\s*[-–]\s*', line, maxsplit=1)
-                    entry['degree'] = parts[0].strip()
-                    if len(parts) > 1:
-                        year_match = re.search(r'(\d{4})\s*$', parts[1])
-                        if year_match:
-                            entry['year'] = year_match.group(1)
-                            entry['institution'] = parts[1][:year_match.start()].strip().rstrip(',|')
-                        else:
-                            entry['institution'] = parts[1].strip()
-            
-            if entry.get('degree'):
-                degree_key = entry['degree'].lower()[:50]
-                if degree_key not in seen_degrees:
-                    seen_degrees.add(degree_key)
-                    education.append({
-                        'degree': entry.get('degree'),
-                        'institution': entry.get('institution'),
-                        'year': entry.get('year')
-                    })
+                        year = year_match.group()
+                    
+                    key = (degree.lower()[:50], (institution or '').lower()[:50])
+                    if key not in seen_degrees:
+                        seen_degrees.add(key)
+                        education.append({
+                            'degree': degree,
+                            'institution': institution,
+                            'year': year
+                        })
     
-    # Post-process: Extract institution from degree string if missing
+    # Post-process: Remove entries with pipes and duplicates
+    # First, sort by degree length (longer = more complete)
+    education.sort(key=lambda x: len(x.get('degree', '')), reverse=True)
+    
+    filtered = []
     for edu in education:
-        if not edu.get('institution') and edu.get('degree'):
-            degree = edu['degree']
+        degree = edu.get('degree', '') or ''
+        inst = edu.get('institution', '') or ''
+        
+        if not degree or len(degree) < 5:
+            continue
+        if '|' in degree or '|' in inst:
+            continue
+        
+        degree_lower = degree.lower()
+        
+        # Check if this is a subset of an existing entry
+        is_dup = False
+        for existing in filtered:
+            existing_degree = existing.get('degree', '').lower()
             
-            # Pattern 1: "..., University of X, ..."
-            univ_match = re.search(r',\s*(University\s+of\s+[^,]+|[A-Z][a-z]+\s+University[^,]*)', degree)
-            if univ_match:
-                edu['institution'] = univ_match.group(1).strip().rstrip('.')
-                edu['degree'] = degree[:univ_match.start()].strip().rstrip(',')
-                continue
+            # If current degree is contained in existing (shorter version), skip
+            if degree_lower in existing_degree:
+                is_dup = True
+                break
             
-            # Pattern 2: "... from University"
-            from_match = re.search(r'(.+?)\s+(?:from|at)\s+([^,]+University[^,]*)', degree, re.IGNORECASE)
-            if from_match:
-                edu['degree'] = from_match.group(1).strip()
-                edu['institution'] = from_match.group(2).strip().rstrip('.')
-                continue
-            
-            # Pattern 3: Just look for University in comma-separated parts
-            parts = [p.strip() for p in degree.split(',')]
-            for i, part in enumerate(parts):
-                if 'university' in part.lower() or 'college' in part.lower() or 'institute' in part.lower():
-                    edu['institution'] = part.strip().rstrip('.')
-                    edu['degree'] = ', '.join(parts[:i]).strip()
+            # If same year and similar degree start, consider duplicate
+            if edu.get('year') == existing.get('year'):
+                # Check if first 15 chars match (same degree type)
+                if degree_lower[:15] == existing_degree[:15]:
+                    is_dup = True
                     break
+        
+        if not is_dup:
+            filtered.append(edu)
     
-    return education[:10]
+    return filtered[:10]
 
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                  EXTRACTION AGENT - CERTIFICATIONS                           ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def extract_certifications(text: str) -> List[str]:
     """Extract certifications from resume text (v8.6)."""
