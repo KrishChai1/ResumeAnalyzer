@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 # ║                           CONFIGURATION                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-VERSION = "8.8.0"
+VERSION = "8.9.0"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Month name to number mapping
@@ -975,9 +975,17 @@ def extract_responsibilities(lines: List[str], start_idx: int, end_idx: int) -> 
             after_resp_header = True
             continue
         
-        # Stop at next Project/Client/Duration section
-        if re.match(r'^(Project|Client|Duration|Environment|Description)\s*[:\t]', stripped, re.IGNORECASE):
+        # Stop at next Client section (not Project/Description which come before responsibilities)
+        if re.match(r'^Client\s*[:\t]', stripped, re.IGNORECASE):
             break
+        
+        # Skip Project/Description headers (responsibilities come after these)
+        if re.match(r'^(Project|Duration|Environment|Description)\s*[:\t]', stripped, re.IGNORECASE):
+            continue
+        
+        # Skip lines that are clearly not responsibilities
+        if re.match(r'^(This is|This project)', stripped, re.IGNORECASE):
+            continue
         
         # Plain text responsibility (sentence starting with action verb)
         if re.match(r'^(Participate|Collaborate|Wrote|Test|Revise|Improve|Involve|Serve|Design|Develop|Manage|Create|Implement|Lead|Support|Analyze|Build|Configure|Maintain|Monitor|Deploy|Review|Ensure|Establish|Coordinate|Execute|Perform|Provide|Work|Assist|Conduct|Document|Deliver|Define|Evaluate|Facilitate|Guide|Handle|Identify|Install|Integrate|Investigate|Launch|Migrate|Optimize|Organize|Oversee|Plan|Prepare|Process|Produce|Program|Research|Resolve|Schedule|Secure|Setup|Streamline|Supervise|Train|Troubleshoot|Update|Upgrade|Validate|Verify|Write)', stripped, re.IGNORECASE):
@@ -2094,9 +2102,33 @@ def extract_experiences(text: str) -> List[Dict]:
         if employer.lower().startswith('duration'):
             continue
         
+        # Skip entries where employer looks like a responsibility sentence
+        if re.match(r'^(Experienced|Worked|Conducted|Designed|Developed|Managed|Led|Supported|Followed)', employer, re.IGNORECASE):
+            continue
+        
         # Skip entries without both employer and title
         if not employer and not exp.get('title'):
             continue
+        
+        # Skip entries where "employer" looks like a job title (extraction error)
+        # Job titles typically START with role words like "Senior", "Lead", "Consultant", etc.
+        title_start_patterns = [
+            r'^senior\s', r'^sr\.?\s', r'^junior\s', r'^jr\.?\s',
+            r'^lead\s', r'^principal\s', r'^staff\s', r'^associate\s',
+            r'^consultant', r'^developer', r'^engineer', r'^architect',
+            r'^analyst', r'^manager', r'^specialist', r'^coordinator',
+            r'^administrator', r'^director', r'^technical\s+lead'
+        ]
+        
+        emp_lower = employer.lower().strip()
+        looks_like_title = any(re.match(p, emp_lower) for p in title_start_patterns)
+        
+        if looks_like_title:
+            # Check if the "title" field is very long (a description, not a real title)
+            title = exp.get('title') or ''
+            if len(title) > 80:
+                # This is definitely a misextraction - skip this entry
+                continue
         
         # Clean "Client:" prefix from employer names
         if employer.lower().startswith('client:'):
@@ -2141,7 +2173,39 @@ def extract_education(text: str) -> List[Dict]:
     """Extract education from resume text (v8.6)."""
     education = []
     seen_degrees = set()
+
+    # Also check for university on a separate line after degree
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        line_lower = line.lower().strip()
+        
+        # Check for "Education" header followed by University then Degree
+        if line_lower == 'education' and i + 2 < len(lines):
+            next_line = lines[i + 1].strip()
+            next_next_line = lines[i + 2].strip()
+            
+            # Pattern: Education -> University Name -> Degree
+            if any(kw in next_line.lower() for kw in ['university', 'college', 'institute', 'school']):
+                institution = next_line
+                degree = next_next_line
+                
+                # Extract year if present
+                year_match = re.search(r'(19|20)\d{2}', degree)
+                year = year_match.group(0) if year_match else None
+                
+                # Clean degree
+                degree = re.sub(r':\s*(Spring|Summer|Fall|Winter)?\s*(19|20)\d{2}', '', degree).strip()
+                
+                key = (degree.lower(), (institution or '').lower())
+                if key not in seen_degrees:
+                    seen_degrees.add(key)
+                    education.append({
+                        'degree': degree,
+                        'institution': institution,
+                        'year': year
+                    })
     
+        
     # First check for pipe-separated format: "Education | Degree at/from University"
     for line in text.split('\n'):
         line = line.strip()
@@ -2448,9 +2512,49 @@ def extract_title(text: str, experiences: List[Dict]) -> str:
 
 def extract_summary(text: str) -> str:
     """Extract professional summary."""
+    
+    # Strategy 1: Check if resume starts with summary text (before name/contact)
+    # Some resumes have summary at the very top
+    lines = text.split('\n')
+    first_lines = []
+    
+    for line in lines[:15]:
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+        
+        # Stop when we hit name patterns (ALL CAPS name or Title Case Name)
+        if re.match(r'^[A-Z]{2,}\s+[A-Z]{2,}', line_clean):  # ALL CAPS
+            break
+        if re.match(r'^[A-Z][a-z]+\s+[A-Z][a-z]+\s*$', line_clean):  # Title Case
+            break
+        
+        # Stop when we hit contact info
+        if '@' in line_clean:
+            break
+        if re.search(r'\d{3}[-.)\s]?\d{3}', line_clean):
+            break
+        
+        # Stop when we hit experience lines (pipe-separated with dates)
+        if '|' in line_clean and re.search(r'\d{4}', line_clean):
+            break
+        
+        # Collect substantial text lines
+        if len(line_clean) > 30:
+            first_lines.append(line_clean)
+    
+    if first_lines:
+        potential_summary = ' '.join(first_lines)
+        # Check if it looks like a summary (contains experience/years/expertise keywords)
+        if any(kw in potential_summary.lower() for kw in ['experience', 'years', 'expertise', 'skilled', 'proficient', 'background']):
+            return potential_summary[:2000]
+    
+    # Strategy 2: Look for explicit SUMMARY section header
     patterns = [
         r'(?:PROFESSIONAL\s+)?SUMMARY[:\s]*\n(.+?)(?:\nSKILLS|\nEXPERIENCE|\nWORK|\nTECHNICAL|\Z)',
         r'EXPERIENCE\s+SUMMARY[:\s]*\n(.+?)(?:\nTECHNICAL|\nSKILLS|\nPROFESSIONAL|\Z)',
+        r'PROFILE[:\s]*\n(.+?)(?:\nSKILLS|\nEXPERIENCE|\nWORK|\Z)',
+        r'OBJECTIVE[:\s]*\n(.+?)(?:\nSKILLS|\nEXPERIENCE|\nWORK|\Z)',
     ]
     
     for pattern in patterns:
